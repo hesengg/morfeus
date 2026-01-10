@@ -7,6 +7,7 @@ import morfeus.cone_angle
 import morfeus.conformer
 import morfeus.dispersion
 import morfeus.local_force
+import morfeus.multiwfn
 import morfeus.pyramidalization
 import morfeus.sasa
 import morfeus.solid_angle
@@ -31,6 +32,7 @@ def main() -> None:
             "sterimol": morfeus.sterimol.cli,
             "visible_volume": morfeus.visible_volume.cli,
             "xtb": morfeus.xtb.cli,
+            "multiwfn": morfeus.multiwfn.cli,
         }
     )
 

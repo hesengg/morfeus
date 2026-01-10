@@ -6,3 +6,4 @@ dependencies:
   - packaging
   - python>=3.10
   - scipy
+  - pexpect
