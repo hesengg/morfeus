@@ -52,11 +52,13 @@ class CommandStep:
         expect: Pattern to expect before sending
         optional: If True, only execute if expect pattern is found in output;
                   if False, always execute regardless
+        wait: If True, wait for any progress bar to complete before sending
     """
 
     cmd: str | None = None
     expect: str | None = None
     optional: bool = False
+    wait: bool = False
 
 
 @dataclass
@@ -65,7 +67,6 @@ class MultiwfnRunResult:
 
     stdout: str
     workdir: Path
-    generated_files: list[Path]
 
 
 @dataclass
@@ -74,8 +75,9 @@ class MultiwfnResults:
 
     charges: dict[str, dict[int, float]] | None = None
     surfaces: dict[str, dict[str, Any]] | None = None
+    atomic_descriptors: dict[int, float] | None = None
     grid_descriptors: dict[int, float] | None = None
-    output_paths: list[Path] | None = None
+    electric_moments: dict[str, float] | None = None
     citations: set[str] | None = None
 
 
@@ -83,16 +85,18 @@ class _PexpectSession:
     """Pexpect session manager for Multiwfn."""
 
     def __init__(
-        self, workdir: Path, timeout: int, expect_timeout: int, debug: bool
+        self,
+        base_command: str,
+        workdir: Path,
+        debug: bool,
     ) -> None:
         self._child = pexpect.spawn(
-            "Multiwfn",
+            base_command,
             cwd=str(workdir),
             encoding="utf-8",
-            timeout=timeout,
         )
-        self._timeout = timeout
-        self._expect_timeout = expect_timeout
+        self._timeout = 10
+        self._expect_timeout = 3
         self._debug = debug
         self._transcript: list[str] = []
         self._last_command_pos = 0
@@ -100,14 +104,52 @@ class _PexpectSession:
     def read_available(self) -> None:
         """Read available output without blocking."""
         try:
-            chunk = self._child.read_nonblocking(size=4096, timeout=30)
+            chunk = self._child.read_nonblocking(size=4096, timeout=0.1)
             if chunk:
                 self._transcript.append(chunk)
         except (pexpect.TIMEOUT, pexpect.EOF):
             pass
 
-    def send(self, cmd: str) -> None:
-        """Send command to process."""
+    def wait_for_progress(self) -> None:
+        """Wait for any ongoing progress bar to complete."""
+        max_retries = 100
+        retry_count = 0
+
+        while retry_count < max_retries:
+            # Read new output with a short wait
+            try:
+                chunk = self._child.read_nonblocking(size=4096, timeout=0.5)
+                if chunk:
+                    self._transcript.append(chunk)
+                    # Check only the newly read chunk for progress bar
+                    has_progress, current_progress = self._has_progress_bar(chunk)
+                    if has_progress:
+                        retry_count += 1
+                        if self._debug:
+                            progress_info = (
+                                f" ({current_progress}%)"
+                                if current_progress is not None
+                                else ""
+                            )
+                            print(f"[DEBUG] Progress bar detected{progress_info}")
+                        continue
+                    # New output without progress bar - done
+                    return
+            except pexpect.TIMEOUT:
+                # No new output available - done waiting
+                return
+            except pexpect.EOF:
+                return
+
+    def send(self, cmd: str, wait: bool = False) -> None:
+        """Send command to process.
+
+        Args:
+            cmd: Command to send
+            wait: If True, wait for any progress bar to complete first
+        """
+        if wait:
+            self.wait_for_progress()
         self._child.sendline(cmd)
         if self._debug:
             print(f"[DEBUG] Sent: {cmd!r}")
@@ -131,65 +173,25 @@ class _PexpectSession:
         return False, None
 
     def expect(self, pattern: str) -> bool:
-        """Wait for pattern. Returns True on match, False on timeout.
-
-        Automatically extends timeout if progress bars are detected.
-        """
+        """Wait for pattern. Returns True on match, False on timeout."""
         if self._debug:
             print(f"[DEBUG] Expecting: {pattern!r}")
 
-        max_retries = 20  # Maximum number of timeout extensions
-        retry_count = 0
-        last_progress = None
+        try:
+            self._child.expect(pattern, timeout=self._expect_timeout)
+            self._transcript.append(self._child.before or "")
+            self._transcript.append(self._child.after or "")
+            if self._debug:
+                print("[DEBUG] Got match")
+            return True
+        except pexpect.TIMEOUT:
+            self.read_available()
+            recent_output = self.get_output_since_last_command()
+            print(f"[WARN] Timeout ({self._expect_timeout}s) waiting for: {pattern!r}")
+            print(f"Recent output: {recent_output[-500:]}")
+            return False
 
-        while retry_count < max_retries:
-            try:
-                timeout = self._expect_timeout if retry_count == 0 else 30
-                self._child.expect(pattern, timeout=timeout)
-                self._transcript.append(self._child.before or "")
-                self._transcript.append(self._child.after or "")
-                if self._debug:
-                    print("[DEBUG] Got match")
-                return True
-            except pexpect.TIMEOUT:
-                self.read_available()
-                recent_output = "".join(self._transcript[-3:])
-                has_progress, current_progress = self._has_progress_bar(recent_output)
-
-                if has_progress:
-                    # Progress bar detected - extend timeout
-                    retry_count += 1
-                    if self._debug:
-                        progress_info = (
-                            f" ({current_progress}%)"
-                            if current_progress is not None
-                            else ""
-                        )
-                        print(
-                            f"[DEBUG] Progress bar detected{progress_info}, extending timeout (retry {retry_count}/{max_retries})"
-                        )
-
-                    # Check if progress is stuck
-                    if current_progress is not None and last_progress is not None:
-                        if abs(current_progress - last_progress) < 0.1:
-                            print(
-                                f"[WARN] Progress appears stuck at {current_progress}%"
-                            )
-                            return False
-                    last_progress = current_progress
-                    continue
-                else:
-                    # No progress bar - actual timeout
-                    print(
-                        f"[WARN] Timeout ({self._expect_timeout}s) waiting for: {pattern!r}"
-                    )
-                    print(f"Recent output: {recent_output[-500:]}")
-                    return False
-
-        print(f"[WARN] Maximum timeout extensions reached waiting for: {pattern!r}")
-        return False
-
-    def try_expect(self, pattern: str, timeout: float = 2.0) -> bool:
+    def try_expect(self, pattern: str, timeout: float = 1.0) -> bool:
         """Try to match pattern with short timeout. Silent on timeout.
 
         Does not extend timeout for progress bars (use expect() for that).
@@ -240,15 +242,48 @@ class _PexpectSession:
         """Full session transcript."""
         return "".join(self._transcript)
 
+    def _execute_command(
+        self, cmd: str, expect: str | None, use_robust: bool, wait: bool = False
+    ) -> None:
+        """Execute command with optional expect."""
+        if use_robust and expect:
+            self.expect(expect)
+        self.send(cmd, wait=wait)
+        if not use_robust:
+            self.read_available()
+
+    def _process_command(self, item: str | CommandStep, use_robust: bool) -> None:
+        """Process command step."""
+        if isinstance(item, str):
+            self._execute_command(item, None, use_robust)
+            return
+
+        if item.optional:
+            # For optional commands, try to match the pattern with a short timeout
+            # If the pattern is found, execute the command; otherwise skip it
+            if item.expect:
+                pattern_found = self.try_expect(item.expect, timeout=1.0)
+                if self._debug:
+                    print(
+                        f"[DEBUG] Optional pattern {'found' if pattern_found else 'not found'}: {item.expect!r}"
+                    )
+                if not pattern_found:
+                    return
+            if item.cmd:
+                self.send(item.cmd, wait=item.wait)
+                if not use_robust:
+                    self.read_available()
+        else:
+            if item.cmd:
+                self._execute_command(item.cmd, item.expect, use_robust, wait=item.wait)
+
 
 class Multiwfn:
     """Multiwfn interface using pexpect for interactive control.
 
     Args:
         file_path: Path to molden/wfn file from xtb or other QM program.
-        output_dir: Directory for output files. Defaults to current directory.
-        timeout: Global timeout in seconds for process operations.
-        expect_timeout: Timeout in seconds for expect pattern matching.
+        run_path: Directory for output files. Defaults to temporary directory.
         robust_mode: If True, wait for expect patterns between commands (slower but safer).
                      If False, send commands without waiting (faster but may desync).
         debug: If True, print debug info including sent commands and expect patterns.
@@ -257,9 +292,7 @@ class Multiwfn:
     def __init__(
         self,
         file_path: str | Path,
-        output_dir: str | Path | None = None,
-        timeout: int = 1800,
-        expect_timeout: int = 30,
+        run_path: str | Path | None = None,
         robust_mode: bool = True,
         debug: bool = False,
     ) -> None:
@@ -267,152 +300,106 @@ class Multiwfn:
         if not self._file_path.exists():
             raise FileNotFoundError(f"File not found: {self._file_path}")
 
-        self._output_dir = Path(output_dir).resolve() if output_dir else Path.cwd()
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._timeout = timeout
-        self._expect_timeout = expect_timeout
+        self._run_path = Path(run_path).resolve() if run_path else None
         self._robust_mode = robust_mode
         self._debug = debug
         self._results = MultiwfnResults()
-        self._custom_settings_path: Path | None = None
+
         self._results.citations = {
             # Both following papers ***MUST BE CITED IN MAIN TEXT*** if Multiwfn is used:
             # See "How to cite Multiwfn.pdf" in Multiwfn binary package for more information
             "Tian Lu, Feiwu Chen, J. Comput. Chem., 33, 580 (2012) DOI: 10.1002/jcc.22885",
             "Tian Lu, J. Chem. Phys., 161, 082503 (2024) DOI: 10.1063/5.0216272",
         }
-        self._results.output_paths = []
-
-    @property
-    def file_path(self) -> Path:
-        """Path to the input molden/wfn file."""
-        return self._file_path
-
-    @property
-    def output_dir(self) -> Path:
-        """Directory for output files."""
-        return self._output_dir
 
     def load_settingsini(self, file_path: str | Path) -> None:
-        """Load custom settings.ini file."""
-        settings_path = Path(file_path).resolve()
-        if not settings_path.exists():
-            raise FileNotFoundError(f"Settings file not found: {settings_path}")
-        self._custom_settings_path = settings_path
+        """Load custom settings.ini file.
+        Overwriting morfeus/config/settings.ini.
 
-    def _setup_settings_ini(self, workdir: Path) -> None:
-        """Copy settings.ini to working directory."""
-        target = workdir / "settings.ini"
+        Args:
+            file_path: Path to custom settings.ini file.
+        """
+        settings_path = Path(file_path).resolve()
+        if not settings_path.exists() or settings_path.name != "settings.ini":
+            raise FileNotFoundError(f"Settings file not found: {settings_path}")
+        self._setup_settings_ini(settings_path)
+
+    def _setup_settings_ini(
+        self, target_path: str | Path = None, file_path: str | Path = None
+    ) -> None:
+        """Copy settings.ini to run_path."""
+        if target_path is None:
+            target_path = self._run_path / "settings.ini"
+
+        target = (
+            Path(target_path) / "settings.ini"
+            if Path(target_path).suffix != ".ini"
+            else Path(target_path)
+        )
+
         if target.exists():
             return
 
-        # Use custom settings if provided, otherwise use default from config
-        if self._custom_settings_path:
-            source = self._custom_settings_path
-        else:
-            # Use package default
+        # Use package default
+        if file_path is None:
             source = Path(__file__).parent / "config" / "settings.ini"
+        else:
+            source = Path(file_path).resolve()
 
         if source.exists():
             shutil.copy2(source, target)
 
-    def _get_workdir(self, subdir: str | None) -> Path:
+    def _commands_change_isuerfunc(self, function: int = -1) -> None:
+        """Adjust the iuserfunc setting.
+        Refer to for a complete list (ctrl F: !Below functions can be selected by "iuserfunc" parameter):
+        https://github.com/foxtran/MultiWFN/blob/master/src/function.f90
+        """
+        return [
+            CommandStep("1000", expect="300 Other functions (Part 3)"),
+            CommandStep("2", expect="2 Set iuserfunc"),
+            CommandStep(
+                str(function), expect="Input index of the user-defined function"
+            ),
+        ]
+
+    def _setup_workdir(self, subdir: str | None) -> Path:
         """Get or create working directory."""
-        workdir = self._output_dir / subdir if subdir else self._output_dir
+        workdir = self._run_path / subdir if subdir else self._run_path
         workdir.mkdir(parents=True, exist_ok=True)
+
+        # Copy the settings.ini file from either the run_path or package default
+        self._setup_settings_ini(workdir)
         return workdir
-
-    def _check_pattern_in_output(self, session: _PexpectSession, pattern: str) -> bool:
-        """Check if pattern exists in recent output."""
-        session.read_available()
-        output_since_last_cmd = session.get_output_since_last_command()
-        return bool(re.search(pattern, output_since_last_cmd, re.IGNORECASE))
-
-    def _execute_command(
-        self, session: _PexpectSession, cmd: str, expect: str | None, use_robust: bool
-    ) -> None:
-        """Execute command with optional expect."""
-        if use_robust and expect:
-            session.expect(expect)
-        session.send(cmd)
-        if not use_robust:
-            session.read_available()
-
-    def _process_command(
-        self, session: _PexpectSession, item: str | CommandStep, use_robust: bool
-    ) -> None:
-        """Process command step, handling optional flag."""
-        if isinstance(item, str):
-            self._execute_command(session, item, None, use_robust)
-            return
-
-        if item.optional:
-            # For optional commands, try to match the pattern with a short timeout
-            # If the pattern is found, execute the command; otherwise skip it
-            if item.expect:
-                pattern_found = session.try_expect(item.expect, timeout=3.0)
-                if self._debug:
-                    print(
-                        f"[DEBUG] Optional pattern {'found' if pattern_found else 'not found'}: {item.expect!r}"
-                    )
-                if not pattern_found:
-                    return
-            if item.cmd:
-                session.send(item.cmd)
-                if not use_robust:
-                    session.read_available()
-        else:
-            if item.cmd:
-                self._execute_command(session, item.cmd, item.expect, use_robust)
 
     @requires_executable(["Multiwfn"])
     def run_commands(
         self,
         commands: Iterable[str | CommandStep],
         subdir: str | None = None,
-        robust_mode: bool | None = None,
-        file_path: str | None = None,
     ) -> MultiwfnRunResult:
         """Run Multiwfn with a custom command sequence.
 
         Args:
             commands: Sequence of commands (strings or CommandStep objects).
-            subdir: Subdirectory within output_dir to store results.
-            robust_mode: Override instance robust_mode for this call.
-
+            subdir: Subdirectory within run_path to store results.
         Returns:
             MultiwfnRunResult with stdout, workdir, and list of generated files.
         """
-        if file_path is None:
-            file_path = self._file_path
 
-        use_robust = robust_mode if robust_mode is not None else self._robust_mode
-        workdir = self._get_workdir(subdir)
-        before = {p.resolve() for p in workdir.glob("*")}
+        workdir = self._setup_workdir(subdir)
 
-        session = _PexpectSession(
-            workdir, self._timeout, self._expect_timeout, self._debug
-        )
-        session.send(str(file_path))
+        session = _PexpectSession("Multiwfn", workdir, self._debug)
+        session.send(str(self._file_path))
         session.read_available()
 
         for item in commands:
-            self._process_command(session, item, use_robust)
+            session._process_command(item, self._robust_mode)
 
         session.wait_for_exit()
-
-        after = {p.resolve() for p in workdir.glob("*")}
-        new_files = sorted(after - before)
-
-        # Track all generated files
-        if self._results.output_paths is None:
-            self._results.output_paths = []
-        self._results.output_paths.extend(new_files)
 
         return MultiwfnRunResult(
             stdout=session.stdout,
             workdir=workdir,
-            generated_files=new_files,
         )
 
     def get_charges(self, model: str = "ADCH") -> dict[int, float]:
@@ -546,12 +533,12 @@ class Multiwfn:
             CommandStep("12", expect="12 Quantitative analysis of molecular surface"),
             CommandStep("2", expect="2 Select mapped function"),
             CommandStep(menu_cmd, expect=menu_pattern),
-            CommandStep("0", expect="0 Start analysis"),
+            CommandStep("0", expect="0 Start analysis", wait=True),
             CommandStep("1", expect="1 Export surface extrema as surfanalysis.txt"),
             CommandStep("11", expect="11 Output surface properties"),
             CommandStep("n", expect="surface facets to locsurf.pqr"),
             CommandStep("-1", expect="-1 Return to upper level"),
-            CommandStep("-1", expect=" -1 Return to main menu"),
+            CommandStep("-1", expect="-1 Return to main menu"),
             CommandStep("q", expect="Exit program gracefully"),
         ]
 
@@ -572,11 +559,14 @@ class Multiwfn:
         raise NotImplementedError()
 
     @requires_executable(["Multiwfn"])
-    def grid_to_descriptors(self, grid_path) -> dict[int, float]:
+    def grid_to_descriptors(
+        self, grid_path, userfunction: int = -1
+    ) -> dict[int, float]:
         """Calculate atomic densities from integration in fuzzy atomic spaces.
 
         Args:
             grid_path: Path to a grid file in .cub or .grd
+            userfunction: User-defined function index for integration.
 
         Returns:
             Dictionary mapping atom index (1-based) to integrated density value.
@@ -590,26 +580,30 @@ class Multiwfn:
         if self._results.grid_descriptors is not None:
             return self._results.grid_descriptors
 
-        workdir = self._get_workdir("density")
-        self._setup_settings_ini(workdir)
-
-        commands = [
+        commands = self._commands_change_isuerfunc(function=userfunction) + [
             CommandStep("15", expect="15 Fuzzy atomic space analysis"),
             CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
-            CommandStep("100", expect="100 User-defined function"),
+            CommandStep("100", expect="100 User-defined function", wait=True),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="Exit program gracefully"),
         ]
 
-        result = self.run_commands(commands, subdir="density")
+        result = self.run_commands(commands, subdir="grid")
         grid_descriptors = self._parse_atomic_values(result.stdout)
 
         self._results.grid_descriptors = grid_descriptors
 
         return grid_descriptors
 
-    def molden_to_grid(self, descriptor: str, grid_quality: str) -> str:
-
+    def molden_to_grid(
+        self, descriptor: str, grid_quality: str, grid_file_name: str = None
+    ) -> str:
+        """Generate a grid (.cub) file for a real space function.
+        Args:
+            descriptor: Descriptor to calculate on grid.
+            grid_quality: Grid quality, one of 'low', 'medium', 'high'.
+            grid_file_name: Optional name for output cube file.
+        """
         if descriptor not in REAL_SPACE_FUNCTIONS:
             raise ValueError(
                 f"Descriptor {descriptor!r} not supported. Choose between {', '.join(REAL_SPACE_FUNCTIONS.keys())}."
@@ -633,14 +627,21 @@ class Multiwfn:
             ),
             CommandStep(menu_cmd, expect=menu_pattern),
             CommandStep(grid_cmd, expect=grid_pattern),
-            CommandStep("2", expect="2 Export data to a Gaussian-type cube file"),
+            CommandStep(
+                "2", expect="2 Export data to a Gaussian-type cube file", wait=True
+            ),
             CommandStep("0", expect="0 Return to main menu"),
             CommandStep("q", expect="gracefully"),
         ]
-
         result = self.run_commands(commands, subdir=descriptor)
 
-        return result.workdir / "density.cub"
+        cub_file_name = next(f for f in result.workdir.iterdir() if f.suffix == ".cub")
+        if grid_file_name is not None:  # Rename the file
+            new_path = result.workdir / grid_file_name
+            cub_file_name.rename(new_path)
+            return new_path
+
+        return result.workdir / cub_file_name
 
     def get_descriptor(self, descriptor: str) -> dict[int, float]:
         """Calculate atomic densities from integration in fuzzy atomic spaces.
@@ -652,6 +653,12 @@ class Multiwfn:
             raise ValueError(
                 f"Descriptor {descriptor!r} not supported. Choose between {', '.join(REAL_SPACE_FUNCTIONS.keys())}."
             )
+
+        if (
+            self._results.atomic_descriptors is not None
+            and descriptor in self._results.atomic_descriptors
+        ):
+            return self._results.atomic_descriptors[descriptor]
 
         menu_pattern = REAL_SPACE_FUNCTIONS[descriptor]
         menu_cmd = menu_pattern.split(" ")[0]
@@ -668,12 +675,54 @@ class Multiwfn:
         ]
         result = self.run_commands(commands, subdir=descriptor)
         descriptor_result = self._parse_atomic_values(result.stdout)
+
+        if self._results.atomic_descriptors is None:
+            self._results.atomic_descriptors = {}
+        self._results.atomic_descriptors[descriptor] = descriptor_result
+
         return descriptor_result
 
+    """
     def molden_to_grid_descriptors(self, descriptor, grid_parameters) -> dict:
         grid_path = self.molden_to_grid(descriptor, grid_parameters)
         grid_descriptors = self.grid_to_descriptors(grid_path)
         return grid_descriptors
+    """
+
+    def get_electric_moments(self) -> dict:
+        """Calculate electric dipole/multipole moments."""
+        commands = [
+            CommandStep("300", expect="300 Other functions (Part 3)"),
+            CommandStep("5", expect="5 Calculate electric dipole/multipole moments"),
+            CommandStep("0", expect="0 Return"),
+            CommandStep("q", expect="gracefully"),
+        ]
+        result = self.run_commands(commands, subdir="electric_moments")
+        moments = self._parse_electric_moments(result.stdout)
+
+        if self._results.electric_moments is None:
+            self._results.electric_moments = {}
+        self._results.electric_moments.update(moments)
+
+        return moments
+
+    def _parse_electric_moments(self, stdout: str) -> dict:
+        """Parse electric moments from stdout."""
+        patterns = {
+            "dipole_magnitude_au": r"Magnitude of dipole moment:\s*([-\d.]+)\s+a\.u\.",
+            "quadrupole_traceless_magnitude": r"Magnitude of the traceless quadrupole moment tensor:\s*([-\d.]+)",
+            "quadrupole_spherical_magnitude": r"Magnitude: \|Q_2\|=\s*([-\d.]+)",
+            "octopole_spherical_magnitude": r"Magnitude: \|Q_3\|=\s*([-\d.]+)",
+            "electronic_spatial_extent": r"Electronic spatial extent <r\^2>:\s*([-\d.]+)",
+        }
+
+        moments = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, stdout)
+            if match:
+                moments[key] = float(match.group(1))
+
+        return moments
 
     def _parse_chg_file(self, chg_path: Path) -> dict[int, float]:
         """Parse .chg file to {atom_idx: charge}."""
@@ -773,7 +822,7 @@ class Multiwfn:
         atomic_props = {}
 
         for i, line in enumerate(lines):
-            if "Atom#    All/Positive/Negative area" in line:
+            if "Atom#" in line:
                 atomic_props, avg_idx = self._parse_atomic_areas(lines, i)
                 self._parse_atomic_averages(lines, atomic_props, avg_idx)
                 break
@@ -818,3 +867,26 @@ def cli(file: str) -> Any:
     """CLI entry point for Multiwfn."""
     partial_func = functools.partial(Multiwfn, file)
     return partial_func
+
+
+def molden2aim(
+    path: str,
+    molden_name: str = "xtb.molden",
+    molden2aim_executable_path: str = "molden2aim.exe",
+) -> str:
+    """
+    Utility function to convert normalize molden file using molden2aim (https://github.com/zorkzou/Molden2AIM/tree/main).
+    Args:
+        path (str): Path to working directory in which a molden2aim executable is located.
+        molden_name (str): Name of the molden file to convert.
+    """
+    session = _PexpectSession(
+        path,
+        base_command=f"./{molden2aim_executable_path} -i {molden_name}",
+    )
+    commands = ["Yes", "No", "No", "No"]
+    for item in commands:
+        session.send(item)
+    session.wait_for_exit()
+
+    return molden_name.split(".molden")[0] + "_new.molden"

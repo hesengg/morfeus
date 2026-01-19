@@ -2,3 +2,4 @@ fire
 numpy
 packaging
 scipy
+pexpect
