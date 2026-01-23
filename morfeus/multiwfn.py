@@ -1,18 +1,22 @@
-"""Multiwfn (http://sobereva.com/multiwfn/) interface code using pexpect for interactive control."""
+"""Multiwfn (http://sobereva.com/multiwfn/) interface code.
+
+Uses pexpect for interactive control.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import functools
 from pathlib import Path
 import re
 import shutil
+import tempfile
 import time
-from typing import Any, Iterable
+from typing import Any, cast, Iterable
 
 import pexpect
 
-from morfeus.utils import requires_executable
+from morfeus.utils import build_execution_env, requires_executable
 
 REAL_SPACE_FUNCTIONS = {
     "rho": "1 Electron density",
@@ -68,6 +72,16 @@ class WaitProgress:
 
 
 @dataclass
+class ProgressState:
+    """Track progress bar waiting state."""
+
+    last_activity: float
+    saw_progress: bool
+    saw_please_wait: bool
+    idle_timeout: float
+
+
+@dataclass
 class MultiwfnRunResult:
     """Result from a single Multiwfn run."""
 
@@ -81,10 +95,11 @@ class MultiwfnResults:
 
     charges: dict[str, dict[int, float]] | None = None
     surfaces: dict[str, dict[str, Any]] | None = None
-    atomic_descriptors: dict[int, float] | None = None
+    atomic_descriptors: dict[str, dict[int, float]] | None = None
     grid_descriptors: dict[int, float] | None = None
     electric_moments: dict[str, float] | None = None
-    citations: set[str] | None = None
+    bond_orders: dict[str, dict[tuple[int, int], float]] | None = None
+    citations: set[str] = field(default_factory=set)
 
 
 class _PexpectSession:
@@ -95,11 +110,13 @@ class _PexpectSession:
         base_command: str,
         workdir: Path,
         debug: bool,
+        env: dict[str, str] | None = None,
     ) -> None:
         self._child = pexpect.spawn(
             base_command,
             cwd=str(workdir),
             encoding="utf-8",
+            env=env,
         )
         self._timeout = 10
         self._expect_timeout = 3
@@ -127,6 +144,8 @@ class _PexpectSession:
                 if self._should_stop_on_timeout(state):
                     return
                 continue
+            if chunk == "EOF":
+                return
             if chunk == "":
                 continue
             if self._handle_progress_chunk(state, chunk):
@@ -146,9 +165,17 @@ class _PexpectSession:
     def _has_progress_bar(self, text: str) -> tuple[bool, float | None]:
         """Check if text contains a progress bar and extract percentage.
 
+        Args:
+            text: Text chunk to inspect.
+
         Returns:
-            Tuple of (has_progress_bar, percentage)
+            Tuple of (has_progress_bar, percentage).
         """
+        bar_match = re.search(r"\[([#=\-]+)\]", text)
+        if bar_match:
+            bar = bar_match.group(1)
+            if "-" not in bar:
+                return True, 100.0
         # Match patterns like: "Progress: [###---] 14.3 %" or "14.3 %"
         progress_pattern = r"Progress:\s*\[[#-]+\]\s+([\d.]+)\s*%"
         match = re.search(progress_pattern, text)
@@ -180,9 +207,16 @@ class _PexpectSession:
             return False
 
     def try_expect(self, pattern: str, timeout: float = 1.0) -> bool:
-        """Try to match pattern with short timeout. Silent on timeout.
+        """Try to match a pattern with short timeout. Silent on timeout.
 
         Does not extend timeout for progress bars (use expect() for that).
+
+        Args:
+            pattern: Regular expression to match.
+            timeout: Timeout in seconds.
+
+        Returns:
+            True if the pattern is matched.
         """
         if self._debug:
             print(f"[DEBUG] Try expecting: {pattern!r} (timeout={timeout}s)")
@@ -254,27 +288,40 @@ class _PexpectSession:
         if item.optional and item.expect:
             pattern_found = self.try_expect(item.expect, timeout=1.0)
             if self._debug:
-                print(
-                    f"[DEBUG] Optional pattern {'found' if pattern_found else 'not found'}: {item.expect!r}"
-                )
+                status = "found" if pattern_found else "not found"
+                print(f"[DEBUG] Optional pattern {status}: {item.expect!r}")
             if not pattern_found:
                 return
 
         if item.cmd:
             self._execute_command(item.cmd, item.expect, use_robust)
 
-    def _init_progress_state(self, max_wait: float) -> dict[str, float | bool]:
+    def _init_progress_state(self, max_wait: float) -> ProgressState:
+        """Initialize progress waiting state.
+
+        Args:
+            max_wait: Maximum idle time in seconds before timing out.
+
+        Returns:
+            Initialized progress waiting state.
+        """
         now = time.monotonic()
-        return {
-            "last_activity": now,
-            "saw_progress": False,
-            "saw_please_wait": False,
-            "idle_timeout": max_wait,
-        }
+        return ProgressState(
+            last_activity=now,
+            saw_progress=False,
+            saw_please_wait=False,
+            idle_timeout=max_wait,
+        )
 
     def _read_progress_chunk(self) -> str | None:
+        """Read output chunk while waiting for progress.
+
+        Returns:
+            Chunk string, "EOF" on end-of-file, or None on timeout.
+        """
         try:
-            return self._child.read_nonblocking(size=4096, timeout=0.5)
+            chunk = self._child.read_nonblocking(size=4096, timeout=0.5)
+            return cast(str, chunk)
         except pexpect.TIMEOUT:
             if self._debug:
                 print("[DEBUG] No new output while waiting for progress")
@@ -282,37 +329,55 @@ class _PexpectSession:
         except pexpect.EOF:
             if self._debug:
                 print("[DEBUG] EOF reached while waiting for progress")
-            return None
+            return "EOF"
 
-    def _should_stop_on_timeout(self, state: dict[str, float | bool]) -> bool:
-        if (time.monotonic() - state["last_activity"]) >= state["idle_timeout"]:
+    def _should_stop_on_timeout(self, state: ProgressState) -> bool:
+        """Check if progress waiting should stop due to inactivity.
+
+        Args:
+            state: Current progress waiting state.
+
+        Returns:
+            True if waiting should stop.
+        """
+        timeout = (
+            state.idle_timeout if state.saw_progress else min(1.0, state.idle_timeout)
+        )
+        if (time.monotonic() - state.last_activity) >= timeout:
             if self._debug:
-                if state["saw_progress"]:
+                if state.saw_progress:
                     print("[DEBUG] No progress updates within idle timeout; done")
                 else:
-                    print("[DEBUG] No progress observed within idle timeout; done")
+                    print("[DEBUG] No progress observed within timeout; done")
             return True
         return False
 
-    def _handle_progress_chunk(
-        self, state: dict[str, float | bool], chunk: str
-    ) -> bool:
+    def _handle_progress_chunk(self, state: ProgressState, chunk: str) -> bool:
+        """Handle a progress chunk and return True when waiting is done.
+
+        Args:
+            state: Current progress waiting state.
+            chunk: Output chunk from the process.
+
+        Returns:
+            True when waiting should stop.
+        """
         self._transcript.append(chunk)
         if self._debug:
             print(f"[DEBUG] Read chunk while waiting: {chunk!r}")
-        state["last_activity"] = time.monotonic()
+        state.last_activity = time.monotonic()
         if "please wait" in chunk.lower():
-            state["saw_please_wait"] = True
+            state.saw_please_wait = True
             if self._debug:
                 print("[DEBUG] 'Please wait' seen while waiting")
         has_progress, current_progress = self._has_progress_bar(chunk)
         if not has_progress:
-            if state["saw_progress"]:
+            if state.saw_progress:
                 if self._debug:
                     print("[DEBUG] Progress bar no longer detected; done")
                 return True
             return False
-        state["saw_progress"] = True
+        state.saw_progress = True
         if self._debug:
             progress_info = (
                 f" ({current_progress}%)" if current_progress is not None else ""
@@ -331,9 +396,11 @@ class Multiwfn:
     Args:
         file_path: Path to molden/wfn file from xtb or other QM program.
         run_path: Directory for output files. Defaults to temporary directory.
-        robust_mode: If True, wait for expect patterns between commands (slower but safer).
-                     If False, send commands without waiting (faster but may desync).
+        robust_mode: If True, wait for expect patterns between commands (slower but
+            safer).
+            If False, send commands without waiting (faster but may desync).
         debug: If True, print debug info including sent commands and expect patterns.
+        env_variables: Environment variables to use for the Multiwfn process.
     """
 
     def __init__(
@@ -342,29 +409,44 @@ class Multiwfn:
         run_path: str | Path | None = None,
         robust_mode: bool = True,
         debug: bool = False,
+        env_variables: dict[str, str] | None = None,
     ) -> None:
         self._file_path = Path(file_path).resolve()
         if not self._file_path.exists():
             raise FileNotFoundError(f"File not found: {self._file_path}")
 
-        self._run_path = Path(run_path).resolve() if run_path else None
+        if run_path:
+            self._run_path = Path(run_path).resolve()
+        else:
+            self._run_path = Path(
+                tempfile.mkdtemp(prefix="morfeus_multiwfn_")
+            ).resolve()
         self._robust_mode = robust_mode
         self._debug = debug
+        self._env_variables = env_variables
         self._results = MultiwfnResults()
 
         self._results.citations = {
             # Both following papers ***MUST BE CITED IN MAIN TEXT*** if Multiwfn is used:
-            # See "How to cite Multiwfn.pdf" in Multiwfn binary package for more information
-            "Tian Lu, Feiwu Chen, J. Comput. Chem., 33, 580 (2012) DOI: 10.1002/jcc.22885",
+            # See "How to cite Multiwfn.pdf" in Multiwfn binary package for more
+            # information.
+            (
+                "Tian Lu, Feiwu Chen, J. Comput. Chem., 33, 580 (2012) DOI: "
+                "10.1002/jcc.22885"
+            ),
             "Tian Lu, J. Chem. Phys., 161, 082503 (2024) DOI: 10.1063/5.0216272",
         }
 
     def load_settingsini(self, file_path: str | Path) -> None:
         """Load custom settings.ini file.
+
         Overwriting morfeus/config/settings.ini.
 
         Args:
             file_path: Path to custom settings.ini file.
+
+        Raises:
+            FileNotFoundError: If settings.ini does not exist.
         """
         settings_path = Path(file_path).resolve()
         if not settings_path.exists() or settings_path.name != "settings.ini":
@@ -372,7 +454,9 @@ class Multiwfn:
         self._setup_settings_ini(settings_path)
 
     def _setup_settings_ini(
-        self, target_path: str | Path = None, file_path: str | Path = None
+        self,
+        target_path: str | Path | None = None,
+        file_path: str | Path | None = None,
     ) -> None:
         """Copy settings.ini to run_path."""
         if target_path is None:
@@ -396,10 +480,18 @@ class Multiwfn:
         if source.exists():
             shutil.copy2(source, target)
 
-    def _commands_change_isuerfunc(self, function: int = -1) -> None:
+    def _commands_change_isuerfunc(self, function: int = -1) -> list[CommandStep]:
         """Adjust the iuserfunc setting.
-        Refer to for a complete list (ctrl F: !Below functions can be selected by "iuserfunc" parameter):
+
+        Refer to a complete list (ctrl F: !Below functions can be selected by
+        "iuserfunc" parameter):
         https://github.com/foxtran/MultiWFN/blob/master/src/function.f90
+
+        Args:
+            function: User-defined function index.
+
+        Returns:
+            Command steps to apply iuserfunc.
         """
         return [
             CommandStep("1000", expect="300 Other functions (Part 3)"),
@@ -418,6 +510,10 @@ class Multiwfn:
         self._setup_settings_ini(workdir)
         return workdir
 
+    def _set_env(self) -> dict[str, str]:
+        """Set environment variables for Multiwfn execution."""
+        return build_execution_env(env_variables=self._env_variables)
+
     @requires_executable(["Multiwfn"])
     def run_commands(
         self,
@@ -429,13 +525,14 @@ class Multiwfn:
         Args:
             commands: Sequence of commands (strings or CommandStep objects).
             subdir: Subdirectory within run_path to store results.
-        Returns:
-            MultiwfnRunResult with stdout, workdir, and list of generated files.
-        """
 
+        Returns:
+            MultiwfnRunResult with stdout, workdir
+        """
         workdir = self._setup_workdir(subdir)
 
-        session = _PexpectSession("Multiwfn", workdir, self._debug)
+        env = self._set_env()
+        session = _PexpectSession("Multiwfn", workdir, self._debug, env=env)
         session.send(str(self._file_path))
         session.read_available()
 
@@ -481,12 +578,16 @@ class Multiwfn:
         citations = {
             "Hirshfeld": "Theor. Chim. Acta. (Berl), 44, 129-138 (1977)",
             "VDD": "J. Comput. Chem., 25, 189.",
-            "ADCH": "Tian Lu, Feiwu Chen, Atomic dipole moment corrected Hirshfeld population method, J. Theor. Comput. Chem., 11, 163 (2012)",
+            "ADCH": (
+                "Tian Lu, Feiwu Chen, Atomic dipole moment corrected Hirshfeld "
+                "population method, J. Theor. Comput. Chem., 11, 163 (2012)"
+            ),
         }
 
         if model not in models:
+            choices = ", ".join(models.keys())
             raise ValueError(
-                f"Charge model {model!r} not supported. Choose between {', '.join(models.keys())}."
+                f"Charge model {model!r} not supported. Choose between {choices}."
             )
 
         menu_pattern = models[model]
@@ -528,7 +629,7 @@ class Multiwfn:
         return charges
 
     @requires_executable(["Multiwfn"])
-    def get_surface(self, model: str = "ESP") -> dict[int, dict[str, float]]:
+    def get_surface(self, model: str = "ESP") -> dict[str, Any]:
         """Calculate molecular surface properties.
 
         Args:
@@ -566,14 +667,17 @@ class Multiwfn:
         }
 
         if model not in models:
+            choices = ", ".join(models.keys())
             raise ValueError(
-                f"Surface model {model!r} not supported. Choose between {', '.join(models.keys())}."
+                f"Surface model {model!r} not supported. Choose between {choices}."
             )
         menu_pattern = models[model]
         menu_cmd = menu_pattern.split(" ")[0]
 
         self._results.citations.add(
-            "Tian Lu, Feiwu Chen, Quantitative analysis of molecular surface based on improved Marching Tetrahedra algorithm, J. Mol. Graph. Model., 38, 314-323 (2012)"
+            "Tian Lu, Feiwu Chen, Quantitative analysis of molecular surface based "
+            "on improved Marching Tetrahedra algorithm, J. Mol. Graph. Model., 38, "
+            "314-323 (2012)"
         )
 
         commands = [
@@ -581,7 +685,6 @@ class Multiwfn:
             CommandStep("2", expect="2 Select mapped function"),
             CommandStep(menu_cmd, expect=menu_pattern),
             CommandStep("0", expect="0 Start analysis"),
-            # CommandStep("1", expect="1 Export surface extrema as surfanalysis.txt"),
             WaitProgress(),
             CommandStep("11", expect="11 Output surface properties"),
             CommandStep("n", expect="surface facets to locsurf.pqr"),
@@ -603,11 +706,65 @@ class Multiwfn:
         return surface_result
 
     def get_bond_order(self, model: str) -> dict[tuple[int, int], float]:
-        raise NotImplementedError()
+        """Calculate bond orders.
+
+        Args:
+            model: Bond order model to use.
+
+        Returns:
+            Bond order matrix as {(i, j): bond_order}.
+
+        Raises:
+            ValueError: If given bond order model is not available.
+        """
+        if self._results.bond_orders is not None and model in self._results.bond_orders:
+            return self._results.bond_orders[model]
+
+        bond_orders = {
+            "mayer": "1 Mayer bond order analysis",
+            "wiberg": "3 Wiberg bond order analysis in Lowdin orthogonalized basis",
+            "wilberg": "3 Wiberg bond order analysis in Lowdin orthogonalized basis",
+            "mulliken": "4 Mulliken bond order (Mulliken overlap population) analysis",
+            "fuzzy": "7 Fuzzy bond order analysis (FBO)",
+            "laplacian": "8 Laplacian bond order (LBO)",
+        }
+
+        if model not in bond_orders:
+            choices = ", ".join(sorted(bond_orders.keys()))
+            raise ValueError(
+                "Bond order type " f"{model!r} not supported. Choose between {choices}."
+            )
+
+        menu_pattern = bond_orders[model]
+        menu_cmd = menu_pattern.split(" ")[0]
+
+        if model == "laplacian":
+            self._results.citations.add(
+                "Tian Lu and Feiwu Chen, Bond Order Analysis Based on the Laplacian of "
+                "Electron Density in Fuzzy Overlap Space, J. Phys. Chem. A, 117, "
+                "3100-3108 (2013)"
+            )
+        commands = [
+            CommandStep("9", expect="9 Bond order analysis"),
+            CommandStep(menu_cmd, expect=menu_pattern),
+            WaitProgress(),
+            CommandStep("n", expect="outputting bond order matrix"),
+            CommandStep("0", expect="0 Return"),
+            CommandStep("q", expect="gracefully"),
+        ]
+
+        result = self.run_commands(commands, subdir=model)
+        bond_order_matrix = self._parse_bond_orders(result.stdout)
+
+        if self._results.bond_orders is None:
+            self._results.bond_orders = {}
+        self._results.bond_orders[model] = bond_order_matrix
+
+        return bond_order_matrix
 
     @requires_executable(["Multiwfn"])
     def grid_to_descriptors(
-        self, grid_path, userfunction: int = -1
+        self, grid_path: str | Path, userfunction: int = -1
     ) -> dict[int, float]:
         """Calculate atomic densities from integration in fuzzy atomic spaces.
 
@@ -621,6 +778,7 @@ class Multiwfn:
         Raises:
             ValueError: If input file is not a cube/grid file.
         """
+        grid_path = Path(grid_path)
         if grid_path.suffix.lower() not in {".cub", ".grd"}:
             raise ValueError("Density analysis requires a .cub or .grd file as input.")
 
@@ -644,17 +802,28 @@ class Multiwfn:
         return grid_descriptors
 
     def molden_to_grid(
-        self, descriptor: str, grid_quality: str, grid_file_name: str = None
-    ) -> str:
+        self,
+        descriptor: str,
+        grid_quality: str,
+        grid_file_name: str | None = None,
+    ) -> Path:
         """Generate a grid (.cub) file for a real space function.
+
         Args:
             descriptor: Descriptor to calculate on grid.
             grid_quality: Grid quality, one of 'low', 'medium', 'high'.
             grid_file_name: Optional name for output cube file.
+
+        Returns:
+            Path to the generated cube file.
+
+        Raises:
+            ValueError: If the descriptor is not supported.
         """
         if descriptor not in REAL_SPACE_FUNCTIONS:
+            choices = ", ".join(REAL_SPACE_FUNCTIONS.keys())
             raise ValueError(
-                f"Descriptor {descriptor!r} not supported. Choose between {', '.join(REAL_SPACE_FUNCTIONS.keys())}."
+                f"Descriptor {descriptor!r} not supported. Choose between {choices}."
             )
 
         menu_pattern = REAL_SPACE_FUNCTIONS[descriptor]
@@ -682,23 +851,32 @@ class Multiwfn:
         ]
         result = self.run_commands(commands, subdir=descriptor)
 
-        cub_file_name = next(f for f in result.workdir.iterdir() if f.suffix == ".cub")
+        cub_file_path = next(f for f in result.workdir.iterdir() if f.suffix == ".cub")
+        cub_file_path = cast(Path, cub_file_path)
         if grid_file_name is not None:  # Rename the file
             new_path = result.workdir / grid_file_name
-            cub_file_name.rename(new_path)
+            new_path = cast(Path, new_path)
+            cub_file_path.rename(new_path)
             return new_path
 
-        return result.workdir / cub_file_name
+        return cub_file_path
 
     def get_descriptor(self, descriptor: str) -> dict[int, float]:
         """Calculate atomic densities from integration in fuzzy atomic spaces.
 
         Args:
             descriptor: Descriptor to calculate on grid.
+
+        Returns:
+            Dictionary mapping atom index (1-based) to integrated density value.
+
+        Raises:
+            ValueError: If the descriptor is not supported or requires grid data.
         """
         if descriptor not in REAL_SPACE_FUNCTIONS:
+            choices = ", ".join(REAL_SPACE_FUNCTIONS.keys())
             raise ValueError(
-                f"Descriptor {descriptor!r} not supported. Choose between {', '.join(REAL_SPACE_FUNCTIONS.keys())}."
+                f"Descriptor {descriptor!r} not supported. Choose between {choices}."
             )
 
         if (
@@ -710,7 +888,7 @@ class Multiwfn:
         menu_pattern = REAL_SPACE_FUNCTIONS[descriptor]
         menu_cmd = menu_pattern.split(" ")[0]
 
-        if menu_cmd in [13]:
+        if menu_cmd in {"13"}:
             raise ValueError(f"Descriptor {descriptor!r} requires grid data!")
 
         commands = [
@@ -757,11 +935,17 @@ class Multiwfn:
     def _parse_electric_moments(self, stdout: str) -> dict:
         """Parse electric moments from stdout."""
         patterns = {
-            "dipole_magnitude_au": r"Magnitude of dipole moment:\s*([-\d.]+)\s+a\.u\.",
-            "quadrupole_traceless_magnitude": r"Magnitude of the traceless quadrupole moment tensor:\s*([-\d.]+)",
+            "dipole_magnitude_au": (
+                r"Magnitude of dipole moment:\s*([-\d.]+)\s+a\.u\."
+            ),
+            "quadrupole_traceless_magnitude": (
+                r"Magnitude of the traceless quadrupole moment tensor:\s*([-\d.]+)"
+            ),
             "quadrupole_spherical_magnitude": r"Magnitude: \|Q_2\|=\s*([-\d.]+)",
             "octopole_spherical_magnitude": r"Magnitude: \|Q_3\|=\s*([-\d.]+)",
-            "electronic_spatial_extent": r"Electronic spatial extent <r\^2>:\s*([-\d.]+)",
+            "electronic_spatial_extent": (
+                r"Electronic spatial extent <r\^2>:\s*([-\d.]+)"
+            ),
         }
 
         moments = {}
@@ -789,7 +973,7 @@ class Multiwfn:
     def _parse_atomic_values(self, stdout: str) -> dict[int, float]:
         """Parse fuzzy atomic space integration values from stdout."""
         lines = stdout.split("\n")
-        atomic_values = {}
+        atomic_values: dict[int, float] = {}
 
         for i, line in enumerate(lines):
             if "Atomic space" in line and "Value" in line:
@@ -809,11 +993,47 @@ class Multiwfn:
 
         return atomic_values
 
+    def _parse_bond_orders(self, stdout: str) -> dict[tuple[int, int], float]:
+        """Parse bond order matrix from Multiwfn output."""
+        bond_orders: dict[tuple[int, int], float] = {}
+        atom_pattern = re.compile(r"(\d+)\([A-Z][a-z]?\s*\)")
+        float_pattern = re.compile(r"[-+]?(?:\d*\.\d+|\d+)")
+
+        for line in stdout.splitlines():
+            atom_matches = list(atom_pattern.finditer(line))
+            if len(atom_matches) < 2:
+                continue
+            atom_i = int(atom_matches[0].group(1))
+            atom_j = int(atom_matches[1].group(1))
+            float_matches = float_pattern.findall(line)
+            if not float_matches:
+                continue
+            bond_orders[(atom_i, atom_j)] = float(float_matches[-1])
+
+        if bond_orders:
+            return bond_orders
+
+        for line in stdout.splitlines():
+            if "(" not in line or ")" not in line:
+                continue
+            tokens = line.replace(":", " ").split()
+            atom_tokens = [t for t in tokens if "(" in t and ")" in t]
+            if len(atom_tokens) < 2:
+                continue
+            try:
+                atom_i = int(atom_tokens[0].split("(")[0])
+                atom_j = int(atom_tokens[1].split("(")[0])
+                bond_orders[(atom_i, atom_j)] = float(tokens[-1])
+            except (ValueError, IndexError):
+                continue
+
+        return bond_orders
+
     def _parse_atomic_areas(
         self, lines: list[str], start_idx: int
     ) -> tuple[dict[int, dict[str, float]], int]:
         """Parse atomic surface areas section from stdout."""
-        atomic_props = {}
+        atomic_props: dict[int, dict[str, float]] = {}
         for i in range(start_idx + 1, len(lines)):
             line = lines[i]
             if "Atom#   All/Positive/Negative average" in line:
@@ -825,11 +1045,11 @@ class Multiwfn:
                 try:
                     atom_idx = int(parts[0])
                     atomic_props[atom_idx] = {
-                        "area_total": float(parts[1]),
-                        "area_positive": float(parts[2]),
-                        "area_negative": float(parts[3]),
-                        "min_value": float(parts[4]),
-                        "max_value": float(parts[5]),
+                        "area_total": self._parse_float(parts[1]),
+                        "area_positive": self._parse_float(parts[2]),
+                        "area_negative": self._parse_float(parts[3]),
+                        "min_value": self._parse_float(parts[4]),
+                        "max_value": self._parse_float(parts[5]),
                     }
                 except ValueError:
                     continue
@@ -850,12 +1070,12 @@ class Multiwfn:
                     if atom_idx in atomic_props:
                         atomic_props[atom_idx].update(
                             {
-                                "avg_all": float(parts[1]),
-                                "avg_positive": float(parts[2]),
-                                "avg_negative": float(parts[3]),
-                                "var_all": float(parts[4]),
-                                "var_positive": float(parts[5]),
-                                "var_negative": float(parts[6]),
+                                "avg_all": self._parse_float(parts[1]),
+                                "avg_positive": self._parse_float(parts[2]),
+                                "avg_negative": self._parse_float(parts[3]),
+                                "var_all": self._parse_float(parts[4]),
+                                "var_positive": self._parse_float(parts[5]),
+                                "var_negative": self._parse_float(parts[6]),
                             }
                         )
                 except ValueError:
@@ -888,7 +1108,7 @@ class Multiwfn:
     ) -> dict[int, dict[str, float]]:
         """Parse atomic surface properties from stdout."""
         lines = stdout.split("\n")
-        atomic_props = {}
+        atomic_props: dict[int, dict[str, float]] = {}
 
         for i, line in enumerate(lines):
             if "All/Positive/Negative area" in line:
@@ -949,6 +1169,7 @@ class Multiwfn:
         return props
 
     def _parse_summary_minmax(self, line: str, props: dict[str, float]) -> bool:
+        """Parse a summary line containing both minimal and maximal values."""
         if "Minimal value:" not in line or "Maximal value:" not in line:
             return False
         for label, value in re.findall(
@@ -959,6 +1180,7 @@ class Multiwfn:
         return True
 
     def _parse_summary_key_value(self, line: str, props: dict[str, float]) -> None:
+        """Parse a single summary key/value line."""
         key_raw, rest = line.split(":", 1)
         key = re.sub(r"[()\[\]=]", "", key_raw.strip().lower())
         key = re.sub(r"\s+", "_", key)
@@ -1026,15 +1248,21 @@ def molden2aim(
     molden_name: str = "xtb.molden",
     molden2aim_executable_path: str = "molden2aim.exe",
 ) -> str:
-    """
-    Utility function to convert normalize molden file using molden2aim (https://github.com/zorkzou/Molden2AIM/tree/main).
+    """Normalize molden file using molden2aim.
+
     Args:
-        path (str): Path to working directory in which a molden2aim executable is located.
-        molden_name (str): Name of the molden file to convert.
+        path: Path to working directory containing the molden2aim executable.
+        molden_name: Name of the molden file to convert.
+        molden2aim_executable_path: Name of the molden2aim executable.
+
+    Returns:
+        Name of the converted molden file.
     """
     session = _PexpectSession(
-        path,
         base_command=f"./{molden2aim_executable_path} -i {molden_name}",
+        workdir=Path(path),
+        debug=False,
+        env=build_execution_env(),
     )
     commands = ["Yes", "No", "No", "No"]
     for item in commands:

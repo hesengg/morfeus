@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from numbers import Integral
+import os
 import shutil
 from typing import Any, cast, Literal, overload
 
@@ -34,6 +35,32 @@ from morfeus.typing import (
     ArrayLike2D,
     IntLike,
 )
+from morfeus.config import config
+
+
+def build_execution_env(
+    env_variables: dict[str, str] | None = None,
+    n_processes: int | None = None,
+) -> dict[str, str]:
+    """Build environment variables for external executables.
+
+    Args:
+        env_variables: Explicit environment override. If provided, returned as-is.
+        n_processes: Number of threads to use for OMP/MKL settings.
+
+    Returns:
+        Environment variables for a subprocess.
+    """
+    if env_variables is not None:
+        return env_variables
+
+    env = dict(os.environ)
+    num_threads = n_processes if n_processes is not None else config.OMP_NUM_THREADS
+    env["OMP_NUM_THREADS"] = f"{num_threads},1"
+    env["MKL_NUM_THREADS"] = f"{num_threads}"
+    env["OMP_STACKSIZE"] = config.OMP_STACKSIZE
+    env["OMP_MAX_ACTIVE_LEVELS"] = str(config.OMP_MAX_ACTIVE_LEVELS)
+    return env
 
 
 def get_excluded_from_connectivity(
