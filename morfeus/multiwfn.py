@@ -7,6 +7,7 @@ import functools
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any, Iterable
 
 import pexpect
@@ -52,13 +53,18 @@ class CommandStep:
         expect: Pattern to expect before sending
         optional: If True, only execute if expect pattern is found in output;
                   if False, always execute regardless
-        wait: If True, wait for any progress bar to complete before sending
     """
 
     cmd: str | None = None
     expect: str | None = None
     optional: bool = False
-    wait: bool = False
+
+
+@dataclass
+class WaitProgress:
+    """Wait for a progress bar to complete."""
+
+    max_wait: float = 30.0
 
 
 @dataclass
@@ -110,46 +116,28 @@ class _PexpectSession:
         except (pexpect.TIMEOUT, pexpect.EOF):
             pass
 
-    def wait_for_progress(self) -> None:
-        """Wait for any ongoing progress bar to complete."""
-        max_retries = 100
-        retry_count = 0
-
-        while retry_count < max_retries:
-            # Read new output with a short wait
-            try:
-                chunk = self._child.read_nonblocking(size=4096, timeout=0.5)
-                if chunk:
-                    self._transcript.append(chunk)
-                    # Check only the newly read chunk for progress bar
-                    has_progress, current_progress = self._has_progress_bar(chunk)
-                    if has_progress:
-                        retry_count += 1
-                        if self._debug:
-                            progress_info = (
-                                f" ({current_progress}%)"
-                                if current_progress is not None
-                                else ""
-                            )
-                            print(f"[DEBUG] Progress bar detected{progress_info}")
-                        continue
-                    # New output without progress bar - done
+    def wait_for_progress(self, max_wait: float = 30.0) -> None:
+        """Wait for a progress bar to appear and complete."""
+        state = self._init_progress_state(max_wait)
+        if self._debug:
+            print("[DEBUG] Waiting for progress bar " f"(max_idle_wait={max_wait}s)")
+        while True:
+            chunk = self._read_progress_chunk()
+            if chunk is None:
+                if self._should_stop_on_timeout(state):
                     return
-            except pexpect.TIMEOUT:
-                # No new output available - done waiting
-                return
-            except pexpect.EOF:
+                continue
+            if chunk == "":
+                continue
+            if self._handle_progress_chunk(state, chunk):
                 return
 
-    def send(self, cmd: str, wait: bool = False) -> None:
+    def send(self, cmd: str) -> None:
         """Send command to process.
 
         Args:
             cmd: Command to send
-            wait: If True, wait for any progress bar to complete first
         """
-        if wait:
-            self.wait_for_progress()
         self._child.sendline(cmd)
         if self._debug:
             print(f"[DEBUG] Sent: {cmd!r}")
@@ -242,40 +230,99 @@ class _PexpectSession:
         """Full session transcript."""
         return "".join(self._transcript)
 
-    def _execute_command(
-        self, cmd: str, expect: str | None, use_robust: bool, wait: bool = False
-    ) -> None:
+    def _execute_command(self, cmd: str, expect: str | None, use_robust: bool) -> None:
         """Execute command with optional expect."""
         if use_robust and expect:
             self.expect(expect)
-        self.send(cmd, wait=wait)
+        self.send(cmd)
         if not use_robust:
             self.read_available()
 
-    def _process_command(self, item: str | CommandStep, use_robust: bool) -> None:
+    def _process_command(
+        self, item: str | CommandStep | WaitProgress, use_robust: bool
+    ) -> None:
         """Process command step."""
         if isinstance(item, str):
             self._execute_command(item, None, use_robust)
             return
+        if isinstance(item, WaitProgress):
+            if self._debug:
+                print(f"[DEBUG] Executing WaitProgress (max_wait={item.max_wait}s)")
+            self.wait_for_progress(max_wait=item.max_wait)
+            return
 
-        if item.optional:
-            # For optional commands, try to match the pattern with a short timeout
-            # If the pattern is found, execute the command; otherwise skip it
-            if item.expect:
-                pattern_found = self.try_expect(item.expect, timeout=1.0)
+        if item.optional and item.expect:
+            pattern_found = self.try_expect(item.expect, timeout=1.0)
+            if self._debug:
+                print(
+                    f"[DEBUG] Optional pattern {'found' if pattern_found else 'not found'}: {item.expect!r}"
+                )
+            if not pattern_found:
+                return
+
+        if item.cmd:
+            self._execute_command(item.cmd, item.expect, use_robust)
+
+    def _init_progress_state(self, max_wait: float) -> dict[str, float | bool]:
+        now = time.monotonic()
+        return {
+            "last_activity": now,
+            "saw_progress": False,
+            "saw_please_wait": False,
+            "idle_timeout": max_wait,
+        }
+
+    def _read_progress_chunk(self) -> str | None:
+        try:
+            return self._child.read_nonblocking(size=4096, timeout=0.5)
+        except pexpect.TIMEOUT:
+            if self._debug:
+                print("[DEBUG] No new output while waiting for progress")
+            return None
+        except pexpect.EOF:
+            if self._debug:
+                print("[DEBUG] EOF reached while waiting for progress")
+            return None
+
+    def _should_stop_on_timeout(self, state: dict[str, float | bool]) -> bool:
+        if (time.monotonic() - state["last_activity"]) >= state["idle_timeout"]:
+            if self._debug:
+                if state["saw_progress"]:
+                    print("[DEBUG] No progress updates within idle timeout; done")
+                else:
+                    print("[DEBUG] No progress observed within idle timeout; done")
+            return True
+        return False
+
+    def _handle_progress_chunk(
+        self, state: dict[str, float | bool], chunk: str
+    ) -> bool:
+        self._transcript.append(chunk)
+        if self._debug:
+            print(f"[DEBUG] Read chunk while waiting: {chunk!r}")
+        state["last_activity"] = time.monotonic()
+        if "please wait" in chunk.lower():
+            state["saw_please_wait"] = True
+            if self._debug:
+                print("[DEBUG] 'Please wait' seen while waiting")
+        has_progress, current_progress = self._has_progress_bar(chunk)
+        if not has_progress:
+            if state["saw_progress"]:
                 if self._debug:
-                    print(
-                        f"[DEBUG] Optional pattern {'found' if pattern_found else 'not found'}: {item.expect!r}"
-                    )
-                if not pattern_found:
-                    return
-            if item.cmd:
-                self.send(item.cmd, wait=item.wait)
-                if not use_robust:
-                    self.read_available()
-        else:
-            if item.cmd:
-                self._execute_command(item.cmd, item.expect, use_robust, wait=item.wait)
+                    print("[DEBUG] Progress bar no longer detected; done")
+                return True
+            return False
+        state["saw_progress"] = True
+        if self._debug:
+            progress_info = (
+                f" ({current_progress}%)" if current_progress is not None else ""
+            )
+            print(f"[DEBUG] Progress bar detected{progress_info}")
+        if current_progress is not None and current_progress >= 100.0:
+            if self._debug:
+                print("[DEBUG] Progress bar completed (>=100%)")
+            return True
+        return False
 
 
 class Multiwfn:
@@ -374,7 +421,7 @@ class Multiwfn:
     @requires_executable(["Multiwfn"])
     def run_commands(
         self,
-        commands: Iterable[str | CommandStep],
+        commands: Iterable[str | CommandStep | WaitProgress],
         subdir: str | None = None,
     ) -> MultiwfnRunResult:
         """Run Multiwfn with a custom command sequence.
@@ -533,8 +580,9 @@ class Multiwfn:
             CommandStep("12", expect="12 Quantitative analysis of molecular surface"),
             CommandStep("2", expect="2 Select mapped function"),
             CommandStep(menu_cmd, expect=menu_pattern),
-            CommandStep("0", expect="0 Start analysis", wait=True),
-            CommandStep("1", expect="1 Export surface extrema as surfanalysis.txt"),
+            CommandStep("0", expect="0 Start analysis"),
+            # CommandStep("1", expect="1 Export surface extrema as surfanalysis.txt"),
+            WaitProgress(),
             CommandStep("11", expect="11 Output surface properties"),
             CommandStep("n", expect="surface facets to locsurf.pqr"),
             CommandStep("-1", expect="-1 Return to upper level"),
@@ -545,8 +593,7 @@ class Multiwfn:
         result = self.run_commands(commands, subdir=model)
 
         atomic_props = self._parse_atomic_surface_properties(result.stdout)
-        surfanalysis_file = result.workdir / "surfanalysis.txt"
-        global_props = self.parse_surfanalysis(surfanalysis_file).get("statistics", {})
+        global_props = self._parse_global_surface_properties(result.stdout)
         surface_result = {"atomic": atomic_props, "global": global_props}
 
         if self._results.surfaces is None:
@@ -583,7 +630,8 @@ class Multiwfn:
         commands = self._commands_change_isuerfunc(function=userfunction) + [
             CommandStep("15", expect="15 Fuzzy atomic space analysis"),
             CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
-            CommandStep("100", expect="100 User-defined function", wait=True),
+            CommandStep("100", expect="100 User-defined function"),
+            WaitProgress(),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="Exit program gracefully"),
         ]
@@ -627,9 +675,8 @@ class Multiwfn:
             ),
             CommandStep(menu_cmd, expect=menu_pattern),
             CommandStep(grid_cmd, expect=grid_pattern),
-            CommandStep(
-                "2", expect="2 Export data to a Gaussian-type cube file", wait=True
-            ),
+            CommandStep("2", expect="2 Export data to a Gaussian-type cube file"),
+            WaitProgress(),
             CommandStep("0", expect="0 Return to main menu"),
             CommandStep("q", expect="gracefully"),
         ]
@@ -670,6 +717,7 @@ class Multiwfn:
             CommandStep("15", expect="15 Fuzzy atomic space analysis"),
             CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
             CommandStep(menu_cmd, expect=menu_pattern),
+            WaitProgress(),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
         ]
@@ -814,6 +862,27 @@ class Multiwfn:
                     continue
         return atomic_props
 
+    def _parse_atomic_charge_separation(
+        self, lines: list[str], atomic_props: dict, start_idx: int
+    ) -> dict[int, dict[str, float]]:
+        """Parse atomic internal charge separation section from stdout."""
+        for i in range(start_idx + 1, len(lines)):
+            line = lines[i]
+            if not line.strip():
+                break
+            parts = line.split()
+            if len(parts) >= 4 and parts[0].isdigit():
+                atom_idx = int(parts[0])
+                if atom_idx in atomic_props:
+                    atomic_props[atom_idx].update(
+                        {
+                            "pi": self._parse_float(parts[1]),
+                            "nu": self._parse_float(parts[2]),
+                            "nu_sigma2": self._parse_float(parts[3]),
+                        }
+                    )
+        return atomic_props
+
     def _parse_atomic_surface_properties(
         self, stdout: str
     ) -> dict[int, dict[str, float]]:
@@ -822,12 +891,95 @@ class Multiwfn:
         atomic_props = {}
 
         for i, line in enumerate(lines):
-            if "Atom#" in line:
+            if "All/Positive/Negative area" in line:
                 atomic_props, avg_idx = self._parse_atomic_areas(lines, i)
                 self._parse_atomic_averages(lines, atomic_props, avg_idx)
+                for j in range(avg_idx + 1, len(lines)):
+                    if "Atom#           Pi" in lines[j]:
+                        self._parse_atomic_charge_separation(lines, atomic_props, j)
+                        break
+                break
+            if "Atom#      Area(Ang^2)" in line:
+                atomic_props = self._parse_atomic_simple_table(lines, i)
                 break
 
         return atomic_props
+
+    def _parse_atomic_simple_table(
+        self, lines: list[str], start_idx: int
+    ) -> dict[int, dict[str, float]]:
+        """Parse atomic surface properties from single-table format."""
+        atomic_props: dict[int, dict[str, float]] = {}
+        for i in range(start_idx + 1, len(lines)):
+            line = lines[i]
+            if not line.strip():
+                break
+            parts = line.split()
+            if len(parts) >= 6 and parts[0].isdigit():
+                atom_idx = int(parts[0])
+                atomic_props[atom_idx] = {
+                    "area_total": self._parse_float(parts[1]),
+                    "min_value": self._parse_float(parts[2]),
+                    "max_value": self._parse_float(parts[3]),
+                    "avg_all": self._parse_float(parts[4]),
+                    "var_all": self._parse_float(parts[5]),
+                }
+        return atomic_props
+
+    def _parse_global_surface_properties(self, stdout: str) -> dict[str, float]:
+        """Parse global surface properties from stdout."""
+        lines = stdout.split("\n")
+        props: dict[str, float] = {}
+        in_summary = False
+        for line in lines:
+            if "================= Summary of surface analysis" in line:
+                in_summary = True
+                continue
+            if not in_summary:
+                continue
+            if "Surface analysis finished!" in line:
+                break
+            if not line.strip() or ":" not in line:
+                continue
+
+            handled = self._parse_summary_minmax(line, props)
+            if handled:
+                continue
+            self._parse_summary_key_value(line, props)
+        return props
+
+    def _parse_summary_minmax(self, line: str, props: dict[str, float]) -> bool:
+        if "Minimal value:" not in line or "Maximal value:" not in line:
+            return False
+        for label, value in re.findall(
+            r"(Minimal value|Maximal value)\s*:\s*([-\d.+Ee]+)", line
+        ):
+            key = re.sub(r"\s+", "_", label.strip().lower())
+            props[key] = self._parse_float(value)
+        return True
+
+    def _parse_summary_key_value(self, line: str, props: dict[str, float]) -> None:
+        key_raw, rest = line.split(":", 1)
+        key = re.sub(r"[()\[\]=]", "", key_raw.strip().lower())
+        key = re.sub(r"\s+", "_", key)
+        value = self._parse_first_number(rest)
+        if value is not None:
+            props[key] = value
+        elif re.search(r"\bnan\b", rest, flags=re.IGNORECASE):
+            props[key] = float("nan")
+
+    @staticmethod
+    def _parse_first_number(text: str) -> float | None:
+        match = re.search(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?", text)
+        if match:
+            return float(match.group(0))
+        return None
+
+    @staticmethod
+    def _parse_float(token: str) -> float:
+        if token.lower() == "nan":
+            return float("nan")
+        return float(token)
 
     def parse_surfanalysis(self, filepath: Path) -> dict[str, Any]:
         """Parse surfanalysis.txt for global surface statistics."""
