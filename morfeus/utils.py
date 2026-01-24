@@ -15,6 +15,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 import scipy.spatial
 
+from morfeus import config
 from morfeus.data import (
     atomic_numbers,
     atomic_symbols,
@@ -35,7 +36,6 @@ from morfeus.typing import (
     ArrayLike2D,
     IntLike,
 )
-from morfeus.config import config
 
 
 def build_execution_env(

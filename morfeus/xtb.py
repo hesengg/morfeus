@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import functools
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -18,7 +17,6 @@ from typing import Any, cast
 
 import numpy as np
 
-from morfeus.config import config
 from morfeus.data import (
     AU_TO_DEBYE,
     DEBYE_TO_AU,

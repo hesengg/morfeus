@@ -395,7 +395,8 @@ class Multiwfn:
 
     Args:
         file_path: Path to molden/wfn file from xtb or other QM program.
-        run_path: Directory for output files. Defaults to temporary directory.
+        run_path: Directory for output files. Defaults to temporary directory
+            that is cleaned up when the instance is closed or garbage-collected.
         robust_mode: If True, wait for expect patterns between commands (slower but
             safer).
             If False, send commands without waiting (faster but may desync).
@@ -417,14 +418,15 @@ class Multiwfn:
 
         if run_path:
             self._run_path = Path(run_path).resolve()
+            self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         else:
-            self._run_path = Path(
-                tempfile.mkdtemp(prefix="morfeus_multiwfn_")
-            ).resolve()
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="morfeus_multiwfn_")
+            self._run_path = Path(self._temp_dir.name).resolve()
         self._robust_mode = robust_mode
         self._debug = debug
         self._env_variables = env_variables
         self._results = MultiwfnResults()
+        self._settings_ini_path: Path | None = None
 
         self._results.citations = {
             # Both following papers ***MUST BE CITED IN MAIN TEXT*** if Multiwfn is used:
@@ -437,10 +439,8 @@ class Multiwfn:
             "Tian Lu, J. Chem. Phys., 161, 082503 (2024) DOI: 10.1063/5.0216272",
         }
 
-    def load_settingsini(self, file_path: str | Path) -> None:
-        """Load custom settings.ini file.
-
-        Overwriting morfeus/config/settings.ini.
+    def load_settingini(self, file_path: str | Path) -> None:
+        """Load custom settings.ini file for all future runs.
 
         Args:
             file_path: Path to custom settings.ini file.
@@ -451,34 +451,34 @@ class Multiwfn:
         settings_path = Path(file_path).resolve()
         if not settings_path.exists() or settings_path.name != "settings.ini":
             raise FileNotFoundError(f"Settings file not found: {settings_path}")
-        self._setup_settings_ini(settings_path)
+        self._settings_ini_path = settings_path
+        self._copy_settings_ini(self._run_path)
 
-    def _setup_settings_ini(
-        self,
-        target_path: str | Path | None = None,
-        file_path: str | Path | None = None,
-    ) -> None:
-        """Copy settings.ini to run_path."""
-        if target_path is None:
-            target_path = self._run_path / "settings.ini"
+    def load_settingsini(self, file_path: str | Path) -> None:
+        """Backward-compatible alias for load_settingini()."""
+        self.load_settingini(file_path)
 
-        target = (
-            Path(target_path) / "settings.ini"
-            if Path(target_path).suffix != ".ini"
-            else Path(target_path)
-        )
+    def close(self) -> None:
+        """Clean up temporary working directory, if created."""
+        if self._temp_dir is not None:
+            self._temp_dir.cleanup()
+            self._temp_dir = None
 
-        if target.exists():
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _copy_settings_ini(self, workdir: str | Path) -> None:
+        """Copy configured settings.ini into a working directory."""
+        if self._settings_ini_path is None:
             return
 
-        # Use package default
-        if file_path is None:
-            source = Path(__file__).parent / "config" / "settings.ini"
-        else:
-            source = Path(file_path).resolve()
-
-        if source.exists():
-            shutil.copy2(source, target)
+        target_dir = Path(workdir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "settings.ini"
+        shutil.copy2(self._settings_ini_path, target)
 
     def _commands_change_isuerfunc(self, function: int = -1) -> list[CommandStep]:
         """Adjust the iuserfunc setting.
@@ -506,8 +506,8 @@ class Multiwfn:
         workdir = self._run_path / subdir if subdir else self._run_path
         workdir.mkdir(parents=True, exist_ok=True)
 
-        # Copy the settings.ini file from either the run_path or package default
-        self._setup_settings_ini(workdir)
+        # Copy a custom settings.ini file from run_path
+        self._copy_settings_ini(workdir)
         return workdir
 
     def _set_env(self) -> dict[str, str]:
