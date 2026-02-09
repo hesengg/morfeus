@@ -858,10 +858,18 @@ class TestMultiwfnRunStubs:
 
         monkeypatch.setattr(mwfn, "run_commands", fake_run)
 
+        selected_names = []
         for quality in ("low", "medium", "high", "LOW"):
             grid_file = mwfn.get_grid("rho", quality)
             assert grid_file.suffix == ".cub"
             assert grid_file.exists()
+            selected_names.append(grid_file.name)
+        assert selected_names == [
+            "generated_1.cub",
+            "generated_2.cub",
+            "generated_3.cub",
+            "generated_4.cub",
+        ]
 
         renamed = mwfn.get_grid("rho", "low", grid_file_name="renamed.cub")
         assert renamed.name == "renamed.cub"
@@ -872,6 +880,19 @@ class TestMultiwfnRunStubs:
 
         with pytest.raises(ValueError, match="Grid quality"):
             mwfn.get_grid("rho", "ultra")
+
+    def test_get_grid_raises_when_no_cube_is_generated(
+        self, mwfn, monkeypatch, tmp_path
+    ):
+        """Test get_grid failure when Multiwfn does not produce a cube output."""
+
+        def fake_run(commands, subdir=None):
+            del commands
+            return _make_run_result(tmp_path, subdir, "")
+
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+        with pytest.raises(FileNotFoundError, match="No \\.cub file"):
+            mwfn.get_grid("rho", "low")
 
     def test_grid_to_descriptors_per_file_cache(self, cube_file, monkeypatch, tmp_path):
         """Test descriptor caching is keyed by active grid file path."""
@@ -900,6 +921,13 @@ class TestMultiwfnRunStubs:
         assert second[1] == pytest.approx(2.0)
         assert len(calls) == 2
 
+    def test_grid_to_descriptors_missing_grid_path_raises(self, cube_file, tmp_path):
+        """Test explicit missing grid-path handling."""
+        mwfn = Multiwfn(cube_file, run_path=tmp_path / "grid", has_spin=None)
+        missing = tmp_path / "missing.cub"
+        with pytest.raises(FileNotFoundError, match="Grid file not found"):
+            mwfn.grid_to_descriptors(missing)
+
     def test_get_fukui_and_superdelocalizabilities(self, mwfn, monkeypatch, tmp_path):
         """Test conceptual-DFT methods for success and spin errors."""
         mwfn._has_spin = None
@@ -914,8 +942,10 @@ class TestMultiwfnRunStubs:
         with pytest.raises(ValueError, match="closed-shell"):
             mwfn.get_superdelocalizabilities()
 
+        command_sequences: dict[str | None, list[CommandStep | WaitProgress]] = {}
+
         def fake_run(commands, subdir=None):
-            del commands
+            command_sequences[subdir] = list(commands)
             if subdir == "fukui":
                 stdout = "Atom index      OW f+\n" "   1(C    0.10 0.20 0.30 0.40\n"
             else:
@@ -932,6 +962,50 @@ class TestMultiwfnRunStubs:
         superdeloc = mwfn.get_superdelocalizabilities()
         assert fukui["f_plus"][1] == pytest.approx(0.10)
         assert superdeloc["d_n"][1] == pytest.approx(1.10)
+
+        fukui_commands = command_sequences["fukui"]
+        assert len(fukui_commands) == 6
+        fukui_enter = fukui_commands[3]
+        assert isinstance(fukui_enter, CommandStep)
+        assert fukui_enter.cmd == ""
+        assert fukui_enter.optional
+        assert fukui_enter.expect is not None
+        assert "single-determinant wavefunction" in fukui_enter.expect
+        fukui_return = fukui_commands[4]
+        assert isinstance(fukui_return, CommandStep)
+        assert fukui_return.cmd == "0"
+        assert fukui_return.expect is not None
+        assert "0 Return" in fukui_return.expect
+
+        superdeloc_commands = command_sequences["superdeloc"]
+        assert len(superdeloc_commands) == 6
+        superdeloc_enter = superdeloc_commands[3]
+        assert isinstance(superdeloc_enter, CommandStep)
+        assert superdeloc_enter.cmd == ""
+        assert superdeloc_enter.optional
+        assert superdeloc_enter.expect is not None
+        assert "single-determinant wavefunction" in superdeloc_enter.expect
+
+    def test_get_fukui_and_superdeloc_raise_on_single_determinant_error(
+        self, mwfn, monkeypatch, tmp_path
+    ):
+        """Raise RuntimeError when Multiwfn reports unsupported wavefunction type."""
+        stdout = (
+            " Error: Only closed-shell single-determinant wavefunction is supported "
+            "by this function. Press ENTER button to return"
+        )
+
+        def fake_run(commands, subdir=None):
+            del commands
+            return _make_run_result(tmp_path, subdir, stdout)
+
+        mwfn._has_spin = False
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+
+        with pytest.raises(RuntimeError, match="single-determinant wavefunction"):
+            mwfn.get_fukui()
+        with pytest.raises(RuntimeError, match="single-determinant wavefunction"):
+            mwfn.get_superdelocalizabilities()
 
     def test_get_electric_moments(self, mwfn, monkeypatch, tmp_path):
         """Test electric-moment extraction from stdout."""
@@ -955,6 +1029,100 @@ class TestMultiwfnRunStubs:
         assert moments["octopole_spherical_magnitude"] == pytest.approx(4.56)
         assert moments["electronic_spatial_extent"] == pytest.approx(5.67)
 
+    def test_get_gaps(self, mwfn, monkeypatch, tmp_path):
+        """Test orbital-table gap extraction, caching and spin gating."""
+        mwfn._has_spin = None
+        with pytest.raises(ValueError, match="known spin state"):
+            mwfn.get_gaps()
+
+        def orbital_stdout(has_spin: bool) -> str:
+            if has_spin:
+                return (
+                    "Basic information of all orbitals:\n"
+                    " Orb:    16 Ene(au/eV):    -0.436310     -11.8726 Occ: 2.000000 "
+                    "Type:A+B (A   )\n"
+                    " Orb:    17 Ene(au/eV):    -0.394388     -10.7318 Occ: 1.000000 "
+                    "Type: A  (A   )\n"
+                    " Orb:    18 Ene(au/eV):    -0.289621      -7.8810 Occ: 1.000000 "
+                    "Type: A  (A   )\n"
+                    " Orb:    19 Ene(au/eV):    -0.182842      -4.9754 Occ: 0.000000 "
+                    "Type:A+B (A   )\n"
+                    " Orb:    20 Ene(au/eV):     0.051583       1.4036 Occ: 0.000000 "
+                    "Type:A+B (A   )\n"
+                )
+            return (
+                "Basic information of all orbitals:\n"
+                " Orb:    15 Ene(au/eV):    -0.445904     -12.1337 Occ: 2.000000 Type:A+B (A   )\n"
+                " Orb:    16 Ene(au/eV):    -0.436310     -11.8726 Occ: 2.000000 Type:A+B (A   )\n"
+                " Orb:    17 Ene(au/eV):    -0.394388     -10.7318 Occ: 2.000000 Type:A+B (A   )\n"
+                " Orb:    18 Ene(au/eV):    -0.289621      -7.8810 Occ: 0.000000 Type:A+B (A   )\n"
+                " Orb:    19 Ene(au/eV):    -0.182842      -4.9754 Occ: 0.000000 Type:A+B (A   )\n"
+                " Orb:    20 Ene(au/eV):     0.051583       1.4036 Occ: 0.000000 Type:A+B (A   )\n"
+            )
+
+        calls = {"n": 0}
+
+        def fake_run(commands, subdir=None):
+            del commands
+            calls["n"] += 1
+            stdout = orbital_stdout(bool(mwfn._has_spin))
+            return _make_run_result(tmp_path, subdir, stdout)
+
+        mwfn._has_spin = True
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+        gap_open = mwfn.get_gaps()
+        assert gap_open["orbitals"][17][0] == pytest.approx(-10.7318)
+        assert gap_open["orbitals"][17][1] == pytest.approx(1.0)
+        assert gap_open["orbitals"][17][2] == "A"
+        assert gap_open["gaps"]["homo_index"] == 16
+        sequence_open = gap_open["gaps"]["sequence_ev"]
+        assert sequence_open[0][(16, 17)] == pytest.approx(1.1408)
+        assert sequence_open[2][(18, 19)] == pytest.approx(2.9056)
+        assert "window_n" not in gap_open["gaps"]
+        assert "window_start" not in gap_open["gaps"]
+        assert "window_end" not in gap_open["gaps"]
+        assert "occupation_thresholds" not in gap_open["gaps"]
+        assert mwfn.get_gap() is gap_open
+
+        with pytest.raises(ValueError, match="Upper occupation threshold"):
+            mwfn.get_gaps(occupation_thresholds=(1.5, 1.5))
+        with pytest.raises(ValueError, match="Gap window n"):
+            mwfn.get_gaps(n=-1)
+
+        gap_open_n1 = mwfn.get_gaps(n=1)
+        assert len(gap_open_n1["gaps"]["sequence_ev"]) == 1
+        assert gap_open_n1["gaps"]["sequence_ev"][0][(16, 17)] == pytest.approx(1.1408)
+
+        mwfn._has_spin = False
+        gap_closed = mwfn.get_gaps()
+        assert gap_closed["orbitals"][17][0] == pytest.approx(-10.7318)
+        assert gap_closed["orbitals"][17][1] == pytest.approx(2.0)
+        assert gap_closed["orbitals"][17][2] == "A+B"
+        assert gap_closed["gaps"]["homo_index"] == 17
+        sequence_closed = gap_closed["gaps"]["sequence_ev"]
+        assert len(sequence_closed) == 5
+        assert sequence_closed[2][(17, 18)] == pytest.approx(2.8508)
+        assert mwfn.get_gaps() is gap_closed
+        assert calls["n"] == 3
+
+    def test_get_localization(self, mwfn, monkeypatch, tmp_path):
+        """Test localization extraction and caching."""
+        calls = {"n": 0}
+
+        def fake_run(commands, subdir=None):
+            calls["n"] += 1
+            assert subdir == "localization"
+            assert any(isinstance(item, WaitProgress) for item in commands)
+            stdout = " Localization index:\n    1(C ):  2.572    2(C ):  2.326\n\n"
+            return _make_run_result(tmp_path, subdir, stdout)
+
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+        localization = mwfn.get_localization()
+        assert localization[1] == pytest.approx(2.572)
+        assert localization[2] == pytest.approx(2.326)
+        assert mwfn.get_localization() is localization
+        assert calls["n"] == 1
+
 
 @pytest.mark.multiwfn
 class TestMultiwfnParserHelpers:
@@ -971,6 +1139,16 @@ class TestMultiwfnParserHelpers:
         parsed_fukui = mwfn._parse_fukui(fukui_stdout)
         assert parsed_fukui["f_plus"][1] == pytest.approx(0.10)
         assert parsed_fukui["dd"][1] == pytest.approx(0.40)
+
+        fukui_scientific = (
+            "Atom index      OW f+\n"
+            "   1(C )   1.0E-01  -2.0E-01  3.0e-01  -4.0e+00\n"
+        )
+        parsed_scientific = mwfn._parse_fukui(fukui_scientific)
+        assert parsed_scientific["f_plus"][1] == pytest.approx(0.1)
+        assert parsed_scientific["f_minus"][1] == pytest.approx(-0.2)
+        assert parsed_scientific["f_zero"][1] == pytest.approx(0.3)
+        assert parsed_scientific["dd"][1] == pytest.approx(-4.0)
 
         super_stdout = (
             "Atom      D_N      D_E\n"
@@ -990,6 +1168,21 @@ class TestMultiwfnParserHelpers:
         )
         values = mwfn._parse_atomic_values(stdout)
         assert values == {1: pytest.approx(0.00607663)}
+
+        localization_stdout = (
+            " Localization index:\n"
+            "    1(C ):  2.572    2(C ):  2.326    3(C ):  1.719    4(O ):  5.149\n"
+            "    5(C ):  2.179    6(C ):  2.423    7(H ):  0.296    8(H ):  0.277\n"
+            "    9(H ):  0.277   10(H ):  0.262   11(H ):  0.262   12(H ):  0.259\n"
+            "   13(H ):  0.268   14(H ):  0.281\n"
+            "\n"
+        )
+        localization = mwfn._parse_localization_values(localization_stdout)
+        assert localization[1] == pytest.approx(2.572)
+        assert localization[4] == pytest.approx(5.149)
+        assert localization[14] == pytest.approx(0.281)
+        assert len(localization) == 14
+
         assert mwfn._parse_atomic_values("no matching table") == {}
 
         chg_file = tmp_path / "test.chg"
@@ -1047,6 +1240,87 @@ class TestMultiwfnParserHelpers:
         """Test partial electric-moment extraction with missing fields."""
         parsed = mwfn._parse_electric_moments("Magnitude of dipole moment: 3.0 a.u.")
         assert parsed == {"dipole_magnitude_au": pytest.approx(3.0)}
+
+    def test_parse_homo_lumo_gap(self, mwfn):
+        """Test HOMO/LUMO parser for complete and incomplete outputs."""
+        stdout = (
+            "Orbital    17 is HOMO, energy:   -0.394388 a.u.  -10.731850 eV\n"
+            "Orbital    18 is LUMO, energy:   -0.289621 a.u.   -7.880977 eV\n"
+            "HOMO-LUMO gap:    0.104768 a.u.    2.850873 eV    275.067464 kJ/mol\n"
+        )
+        parsed = mwfn._parse_homo_lumo_gap(stdout)
+        assert parsed["homo_index"] == 17
+        assert parsed["lumo_index"] == 18
+        assert parsed["homo_energy_ev"] == pytest.approx(-10.731850)
+        assert parsed["lumo_energy_ev"] == pytest.approx(-7.880977)
+        assert parsed["homo_lumo_gap_ev"] == pytest.approx(2.850873)
+        assert "homo_energy_au" not in parsed
+        assert "homo_lumo_gap_au" not in parsed
+
+        with pytest.raises(RuntimeError, match="Could not parse HOMO/LUMO"):
+            mwfn._parse_homo_lumo_gap("incomplete output")
+
+    def test_parse_somo_gaps(self, mwfn):
+        """Test SOMO-gap parser from `List all orbitals` output."""
+        stdout = (
+            " Basic information of all orbitals:\n"
+            " Orb:    16 Ene(au/eV):    -0.436310     -11.8726 Occ: 2.000000 Type:A+B (A   )\n"
+            " Orb:    17 Ene(au/eV):    -0.394388     -10.7318 Occ: 1.000000 Type: A  (A   )\n"
+            " Orb:    18 Ene(au/eV):    -0.289621      -7.8810 Occ: 1.000000 Type: A  (A   )\n"
+            " Orb:    19 Ene(au/eV):    -0.182842      -4.9754 Occ: 0.000000 Type:A+B (A   )\n"
+        )
+        parsed = mwfn._parse_somo_gaps(stdout)
+        assert parsed["overall_homo_index"] == 16
+        assert parsed["overall_lumo_index"] == 19
+        assert parsed["somo_indices"] == [17, 18]
+        assert parsed["somo_to_lumo_gap_ev"][17] == pytest.approx(5.7564)
+        assert parsed["somo_to_lumo_gap_ev"][18] == pytest.approx(2.9056)
+        assert parsed["somo_to_homo_gap_ev"][17] == pytest.approx(1.1408)
+        assert parsed["somo_to_homo_gap_ev"][18] == pytest.approx(3.9916)
+        assert "somo_to_lumo_gap_au" not in parsed
+        assert "overall_homo_energy_au" not in parsed
+        assert parsed["occupation_thresholds"] == {"lower": 0.5, "upper": 1.5}
+
+        threshold_stdout = (
+            " Basic information of all orbitals:\n"
+            " Orb:    16 Ene(au/eV):    -0.436310     -11.8726 Occ: 1.900000 Type:A+B (A   )\n"
+            " Orb:    17 Ene(au/eV):    -0.394388     -10.7318 Occ: 1.400000 Type: A  (A   )\n"
+            " Orb:    18 Ene(au/eV):    -0.289621      -7.8810 Occ: 1.600000 Type: A  (A   )\n"
+            " Orb:    19 Ene(au/eV):    -0.182842      -4.9754 Occ: 0.400000 Type:A+B (A   )\n"
+        )
+        parsed_default = mwfn._parse_somo_gaps(threshold_stdout)
+        assert parsed_default["somo_indices"] == [17]
+        assert parsed_default["overall_homo_index"] == 18
+
+        parsed_custom = mwfn._parse_somo_gaps(threshold_stdout, (0.5, 1.7))
+        assert parsed_custom["somo_indices"] == [17, 18]
+        assert parsed_custom["overall_homo_index"] == 16
+        assert parsed_custom["occupation_thresholds"] == {"lower": 0.5, "upper": 1.7}
+
+        with pytest.raises(RuntimeError, match="Could not parse orbital listing"):
+            mwfn._parse_somo_gaps("invalid")
+        with pytest.raises(ValueError, match="Upper occupation threshold"):
+            mwfn._parse_somo_gaps(stdout, (0.8, 0.8))
+
+    def test_parse_surfanalysis_handles_signed_extrema(self, mwfn, tmp_path):
+        """Test surfanalysis parsing with signed extrema values."""
+        content = (
+            "Number of surface minima:    1\n"
+            "   #       a.u.         eV      kcal/mol           X/Y/Z coordinate(Angstrom)\n"
+            "     1  -0.48025989   -13.068536  -301.367885      -2.821749  -1.268933  -1.450532\n"
+            "Number of surface maxima:    1\n"
+            "   #       a.u.         eV      kcal/mol           X/Y/Z coordinate(Angstrom)\n"
+            "     1   0.51741287    14.079520   324.681749      -3.664456   1.168678  -0.808267\n"
+        )
+        path = tmp_path / "surfanalysis.txt"
+        path.write_text(content)
+        parsed = mwfn.parse_surfanalysis(path)
+        stats = parsed["statistics"]
+        assert stats["num_minima"] == 1
+        assert stats["num_maxima"] == 1
+        assert stats["num_extrema"] == 2
+        assert stats["extrema_min"] == pytest.approx(-0.48025989)
+        assert stats["extrema_max"] == pytest.approx(0.51741287)
 
 
 @pytest.mark.multiwfn
@@ -1166,17 +1440,26 @@ class TestPexpectSessionHelpers:
         fake_session._process_command(
             CommandStep("skip", expect="optional", optional=True), use_robust=True
         )
+        fake_session._transcript = ["optional seen in buffered output"]
+        fake_session._last_command_pos = 0
+        fake_session._process_command(
+            CommandStep("run_buffered", expect="optional", optional=True),
+            use_robust=False,
+        )
 
         monkeypatch.setattr(fake_session, "try_expect", try_expect_true)
         fake_session._process_command(
             CommandStep("run", expect="needed", optional=True), use_robust=True
         )
+        fake_session._process_command(CommandStep(""), use_robust=False)
 
         assert ("send", "cmd") in events
         assert ("send", "cmd2") in events
         assert ("wait", 5.0) in events
         assert ("send", "run") in events
+        assert ("send", "run_buffered") in events
         assert ("send", "skip") not in events
+        assert ("send", "") in events
 
     def test_wait_for_progress_loop_timeout(self, fake_session, monkeypatch):
         """Test wait_for_progress early termination when idle timeout is reached."""

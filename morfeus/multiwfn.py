@@ -22,13 +22,30 @@ from morfeus.utils import build_execution_env, requires_executable
 RealFunctionSetting = int | tuple[int, str]
 VectorFunctionSetting = tuple[int, int, int] | tuple[tuple[int, int, int], str]
 
+NUMBER_PATTERN = r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?"
+HOMO_LINE_PATTERN = re.compile(
+    rf"Orbital\s+(\d+)\s+is\s+HOMO,.*?({NUMBER_PATTERN})\s+eV\b"
+)
+LUMO_LINE_PATTERN = re.compile(
+    rf"Orbital\s+(\d+)\s+is\s+LUMO,.*?({NUMBER_PATTERN})\s+eV\b"
+)
+HOMO_LUMO_GAP_PATTERN = re.compile(rf"HOMO-LUMO gap:.*?({NUMBER_PATTERN})\s+eV\b")
+ORBITAL_LINE_PATTERN = re.compile(
+    (
+        rf"^\s*Orb:\s*(\d+).*?Ene\(au/eV\):\s*{NUMBER_PATTERN}\s+"
+        rf"({NUMBER_PATTERN})\s+Occ:\s*({NUMBER_PATTERN})\s+Type:\s*(A\+B|A|B)\b"
+    ),
+    flags=re.MULTILINE,
+)
+SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
+    "Only closed-shell single-determinant wavefunction is supported by this function"
+)
+
 
 REAL_SPACE_FUNCTIONS: dict[str, str] = {
     "rho": "1 Electron density",
     "rho_grad_norm": "2 Gradient norm of rho",
     "rho_lapl": "3 Laplacian of rho",
-    # "orbital_wfn": "4 Value of orbital wavefunction",
-    # "orbital_prop": "44 Orbital probability density",
     "spin_density": "5 Electron spin density",
     "Kr": "6 Hamiltonian kinetic energy density",
     "Gr": "7 Lagrangian kinetic energy density",
@@ -43,9 +60,6 @@ REAL_SPACE_FUNCTIONS: dict[str, str] = {
     "sign_pro": "16 Sign",
     "correlation_alpha": "17 Correlation hole for alpha",
     "ALIE": "18 Average local ionization energy",
-    # "source":"19 Source function, mode: 1",
-    # "EDR": "20 Electron delocal. range func.",
-    # "Dr": "21 Orbital overlap dist. func.",
     "deltag_pro": "22 Delta-g",
     "deltag_hirsh": "23 Delta-g",
     "iri": "24 Interaction region indicator",
@@ -117,18 +131,15 @@ USER_REAL_FUNCTIONS: dict[str, RealFunctionSetting] = {
     "quantum_charge": 65,
     "electrostatic_force_magnitude": 66,
     "electrostatic_charge": 67,
-    # NEW
     "energy_density_electrostatic_sbl": 68,
     "energy_density_quantum_sbl_hamiltonian": 69,
     "energy_density_quantum_sbl_lagrangian": -69,
-    #
     "phase_space_fisher_information_PS_FID": (
         70,
         "Chem. Phys., 435, 49 (2014)",
     ),
     "electron_linear_momentum_magnitude": 74,
     "magnetic_dipole_moment_magnitude": (78, "Theoret. Chim. Acta, 6, 341"),
-    # NEW
     "grad_norm_energy_density": 79,
     "lapl_energy_density": 80,
     "local_electron_correlation": 87,
@@ -142,11 +153,9 @@ USER_REAL_FUNCTIONS: dict[str, RealFunctionSetting] = {
     "fnull": 97,
     "fdual": 98,
     "iri": 99,
-    #
     "disequilibrium_rho2": (100, "Int. J. Quantum Chem., 113, 2589 (2013)"),
     "positive_part_of_ESP": 101,
     "negative_part_of_ESP": 102,
-    # NEW
     "magnitude_electric_field": 103,
     "ultrastrong_interaction": 819,
     "bni": 820,
@@ -156,7 +165,6 @@ USER_REAL_FUNCTIONS: dict[str, RealFunctionSetting] = {
     "dft_xc_closed": 1100,  # closed
     "dft_xc_alpha": 1101,  # open
     "dft_xc_beta": 1102,  # open
-    #
 }
 
 VECTORS: dict[str, VectorFunctionSetting] = {
@@ -168,7 +176,7 @@ VECTORS: dict[str, VectorFunctionSetting] = {
     "lagrangian_kinetic_energy": (84, 85, 86),
 }
 
-USER_REAL_FUNCTIONS_EXPENSIVE: set[str] = {
+REAL_FUNCTIONS_EXPENSIVE: set[str] = {
     "electron_esp_Vele",
     "avg_local_esp",
     "electrostatic_potential_excluding_nucleus_K",
@@ -187,6 +195,7 @@ USER_REAL_FUNCTIONS_EXPENSIVE: set[str] = {
     "negative_part_of_ESP",
     "magnitude_electric_field",
     "steric_charge",
+    "ESP_total",
 }
 
 ALL_FUNCTIONS: set[str] = (
@@ -194,7 +203,7 @@ ALL_FUNCTIONS: set[str] = (
     | set(USER_REAL_FUNCTIONS.keys())
     | set(VECTORS.keys())
 )
-FAST_FUNCTIONS: set[str] = ALL_FUNCTIONS - USER_REAL_FUNCTIONS_EXPENSIVE
+FAST_FUNCTIONS: set[str] = ALL_FUNCTIONS - REAL_FUNCTIONS_EXPENSIVE
 
 CHARGE_MODELS: dict[str, str] = {
     "hirshfeld": "1 Hirshfeld atomic",
@@ -288,9 +297,11 @@ class MultiwfnResults:
     atomic_descriptors: dict[str, dict[int, float]] | None = None
     grid_descriptors: dict[str, dict[int, float]] | None = None
     electric_moments: dict[str, float] | None = None
+    gap: dict[str, dict[str, Any]] | None = None
     bond_orders: dict[str, dict[tuple[int, int], float]] | None = None
     fukui: dict[str, dict[int, float]] | None = None
     superdelocalizabilities: dict[str, dict[int, float]] | None = None
+    localization: dict[int, float] | None = None
     atomic_vector_descriptors: (
         dict[str, dict[int, tuple[float, float, float]]] | None
     ) = None
@@ -433,7 +444,8 @@ class _PexpectSession:
         try:
             self._child.expect(pexpect.EOF, timeout=self._timeout)
         except pexpect.TIMEOUT:
-            print("[WARN] Timeout waiting for EOF")
+            if self._debug:
+                print("[WARN] Timeout waiting for EOF")
         self._transcript.append(self._child.before or "")
         if self._child.isalive():
             self._child.close()
@@ -480,16 +492,24 @@ class _PexpectSession:
             self.wait_for_progress(max_wait=item.max_wait)
             return
 
+        command_expect = item.expect
         if item.optional and item.expect:
             pattern_found = self.try_expect(item.expect, timeout=1.0)
+            if not pattern_found:
+                buffered_output = self.get_output_since_last_command()
+                pattern_found = re.search(item.expect, buffered_output) is not None
+                if self._debug and pattern_found:
+                    print("[DEBUG] Optional pattern found in buffered output")
             if self._debug:
                 status = "found" if pattern_found else "not found"
                 print(f"[DEBUG] Optional pattern {status}: {item.expect!r}")
             if not pattern_found:
                 return
+            # Avoid matching the same already-consumed pattern twice.
+            command_expect = None
 
-        if item.cmd:
-            self._execute_command(item.cmd, item.expect, use_robust)
+        if item.cmd is not None:
+            self._execute_command(item.cmd, command_expect, use_robust)
 
     def _init_progress_state(self, max_wait: float) -> ProgressState:
         """Initialize progress waiting state.
@@ -926,7 +946,7 @@ class Multiwfn:
         Returns:
             Dictionary with 'atomic' and 'global' keys:
                 - 'atomic': Dict mapping atom index (1-based) to atomic properties
-                    - area_total, area_positive, area_negative: Surface areas (Ų)
+                    - area_total, area_positive, area_negative: Surface areas (A^2)
                     - min_value, max_value: Min/max function values
                     - avg_all, avg_positive, avg_negative: Average values
                     - var_all, var_positive, var_negative: Variance values
@@ -1046,20 +1066,25 @@ class Multiwfn:
 
         Raises:
             ValueError: If input file is not a cube/grid file.
+            FileNotFoundError: If a provided grid_path does not exist.
         """
         grids = {".cub", ".grd"}
         grid_file = Path(grid_path).resolve() if grid_path is not None else None
-        input_is_grid = (
-            grid_file is not None and grid_file.suffix.lower() in grids
-        ) or self._file_path.suffix.lower() in grids
-        if not input_is_grid:
-            raise ValueError("Density analysis requires a .cub or .grd file as input.")
+        if grid_file is not None:
+            if grid_file.suffix.lower() not in grids:
+                raise ValueError(
+                    "Density analysis requires a .cub or .grd file as input."
+                )
+            if not grid_file.exists():
+                raise FileNotFoundError(f"Grid file not found: {grid_file}")
+            active_grid = grid_file
+        else:
+            if self._file_path.suffix.lower() not in grids:
+                raise ValueError(
+                    "Density analysis requires a .cub or .grd file as input."
+                )
+            active_grid = self._file_path
 
-        active_grid = (
-            grid_file
-            if grid_file is not None and grid_file.exists()
-            else self._file_path
-        )
         grid_key = str(active_grid)
         if (
             self._results.grid_descriptors is not None
@@ -1106,6 +1131,7 @@ class Multiwfn:
 
         Raises:
             ValueError: If the descriptor is not supported.
+            FileNotFoundError: If no cube file was generated.
         """
         menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
 
@@ -1117,6 +1143,10 @@ class Multiwfn:
             )
         grid_pattern = GRID_QUALITIES[normalized_grid_quality]
         grid_cmd = grid_pattern.split(" ")[0]
+        existing_cub_files: set[Path] = set()
+        grid_workdir = self._run_path / descriptor
+        if grid_workdir.exists():
+            existing_cub_files = set(grid_workdir.glob("*.cub"))
 
         grid_commands: list[CommandStep | WaitProgress] = [
             *commands,
@@ -1133,11 +1163,20 @@ class Multiwfn:
         ]
         result = self.run_commands(grid_commands, subdir=descriptor)
 
-        cub_file_path = next(f for f in result.workdir.iterdir() if f.suffix == ".cub")
-        cub_file_path = cast(Path, cub_file_path)
+        cub_candidates: list[Path] = list(result.workdir.glob("*.cub"))
+        if not cub_candidates:
+            raise FileNotFoundError("No .cub file was generated by Multiwfn.")
+        new_cub_candidates: list[Path] = [
+            path for path in cub_candidates if path not in existing_cub_files
+        ]
+        selection_pool: list[Path] = (
+            new_cub_candidates if new_cub_candidates else cub_candidates
+        )
+        cub_file_path: Path = max(
+            selection_pool, key=lambda path: path.stat().st_mtime_ns
+        )
         if grid_file_name is not None:  # Rename the file
-            new_path = result.workdir / grid_file_name
-            new_path = cast(Path, new_path)
+            new_path: Path = result.workdir / grid_file_name
             cub_file_path.rename(new_path)
             return new_path
 
@@ -1189,10 +1228,18 @@ class Multiwfn:
             CommandStep("22", expect="22 Conceptual DFT"),
             CommandStep("6", expect="6 Calculate condensed OW Fukui"),
             WaitProgress(self._max_wait),
-            CommandStep("0", expect="Fukui potential"),
+            CommandStep(
+                "",
+                expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
+                optional=True,
+            ),
+            CommandStep("0", expect=r"(Fukui potential|0 Return)"),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="fukui")
+        self._raise_if_single_determinant_wavefunction_error(
+            result.stdout, analysis="Fukui function analysis"
+        )
         fukui_results = self._parse_fukui(result.stdout)
 
         self._results.fukui = fukui_results
@@ -1223,10 +1270,18 @@ class Multiwfn:
             CommandStep("22", expect="22 Conceptual DFT"),
             CommandStep("8", expect="8 Calculate nucleophilic and electrophilic"),
             WaitProgress(self._max_wait),
+            CommandStep(
+                "",
+                expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
+                optional=True,
+            ),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="superdeloc")
+        self._raise_if_single_determinant_wavefunction_error(
+            result.stdout, analysis="Superdelocalizability analysis"
+        )
         superdeloc_matrix = self._parse_superdelocalizabilities(result.stdout)
 
         self._results.superdelocalizabilities = superdeloc_matrix
@@ -1409,6 +1464,150 @@ class Multiwfn:
 
         return moments
 
+    def get_gaps(
+        self,
+        n: int = 3,
+        occupation_thresholds: tuple[float, float] = (0.5, 1.5),
+    ) -> dict[str, Any]:
+        """Return orbital energies and HOMO-centered adjacent orbital gaps.
+
+        Args:
+            n: Half-window size around HOMO. A window of `n=3` spans
+                `homo_index - 3` through `homo_index + 3`.
+            occupation_thresholds: `(lower, upper)` thresholds used to classify
+                unoccupied, partially occupied and occupied orbitals.
+
+        Returns:
+            A dictionary with:
+            - `orbitals`: `{index: (energy_ev, occupation, orbital_type)}`
+            - `gaps`: HOMO index/energy and `sequence_ev`, where each entry is
+              `{(i, j): gap_ev}` for adjacent orbitals `i -> j`.
+
+        Raises:
+            ValueError: If spin state is unknown, `n < 0`, or thresholds are invalid.
+        """
+        if self._has_spin is None:
+            raise ValueError(
+                "Gap analysis requires known spin state. "
+                "Initialize Multiwfn with has_spin=True/False."
+            )
+        if n < 0:
+            raise ValueError("Gap window n must be >= 0.")
+
+        lower, upper = self._validate_occupation_thresholds(occupation_thresholds)
+        cache_key = self._gap_cache_key(n=n, lower=lower, upper=upper)
+
+        cached = self._results.gap
+        if cached is not None and cache_key in cached:
+            return cached[cache_key]
+
+        orbitals = self._get_orbital_listing(subdir="orbital_gaps")
+        gap_result = self._build_homo_window_gaps(
+            orbitals,
+            n=n,
+            occupation_thresholds=(lower, upper),
+        )
+
+        if cached is None:
+            cached = {}
+            self._results.gap = cached
+        cached[cache_key] = gap_result
+        return gap_result
+
+    def get_gap(
+        self,
+        n: int = 3,
+        occupation_thresholds: tuple[float, float] = (0.5, 1.5),
+    ) -> dict[str, Any]:
+        """Backward-compatible alias for :meth:`get_gaps`."""
+        return self.get_gaps(n=n, occupation_thresholds=occupation_thresholds)
+
+    def _get_homo_lumo(self) -> dict[str, float | int]:
+        """Calculate eV-based HOMO/LUMO energies and HOMO-LUMO gap."""
+        commands = [
+            CommandStep("0", expect="0 Show molecular structure and view orbitals"),
+            CommandStep("q", expect="gracefully"),
+        ]
+        result = self.run_commands(commands, subdir="homo_lumo")
+        return self._parse_homo_lumo_gap(result.stdout)
+
+    def _get_somo_gaps(
+        self, occupation_thresholds: tuple[float, float] = (0.5, 1.5)
+    ) -> dict[str, Any]:
+        """Calculate eV-based SOMO gaps to overall HOMO and LUMO."""
+        orbitals = self._get_orbital_listing(subdir="somo_gaps")
+        return self._compute_somo_gaps(orbitals, occupation_thresholds)
+
+    @staticmethod
+    def _orbital_listing_commands() -> list[CommandStep]:
+        """Build command sequence for the `List all orbitals` screen."""
+        return [
+            CommandStep("6", expect="6 Check & modify wavefunction"),
+            CommandStep("3", expect="3 List all orbitals"),
+            CommandStep("-1", expect="-1 Return"),
+            CommandStep("q", expect="gracefully"),
+        ]
+
+    def _get_orbital_listing(self, subdir: str) -> list[dict[str, Any]]:
+        """Run orbital listing and parse rows."""
+        result = self.run_commands(self._orbital_listing_commands(), subdir=subdir)
+        return self._parse_orbital_list(result.stdout)
+
+    def _gap_cache_key(self, n: int, lower: float, upper: float) -> str:
+        """Build deterministic cache key for gap requests."""
+        if self._has_spin is None:
+            raise ValueError(
+                "Gap analysis requires known spin state. "
+                "Initialize Multiwfn with has_spin=True/False."
+            )
+        spin_label = "open" if self._has_spin else "closed"
+        return f"{spin_label}:n:{n}:lower:{lower:.8g}:upper:{upper:.8g}"
+
+    @staticmethod
+    def _validate_occupation_thresholds(
+        occupation_thresholds: tuple[float, float],
+    ) -> tuple[float, float]:
+        """Validate and normalize occupation thresholds."""
+        lower, upper = occupation_thresholds
+        if lower < 0:
+            raise ValueError("Lower occupation threshold must be >= 0.")
+        if upper <= lower:
+            raise ValueError("Upper occupation threshold must be greater than lower.")
+        return lower, upper
+
+    @staticmethod
+    def _split_orbitals_by_occupation(
+        orbitals: list[dict[str, Any]],
+        lower: float,
+        upper: float,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split orbitals into unoccupied, partially occupied and occupied groups."""
+        unoccupied = [orb for orb in orbitals if orb["occupation"] < lower]
+        partially_occupied = [
+            orb for orb in orbitals if lower <= orb["occupation"] < upper
+        ]
+        occupied = [orb for orb in orbitals if orb["occupation"] >= upper]
+        return unoccupied, partially_occupied, occupied
+
+    def get_localization(self) -> dict[int, float]:
+        """Calculate localization index from integration in fuzzy atomic spaces."""
+        if self._results.localization is not None:
+            return self._results.localization
+
+        commands = [
+            CommandStep("15", expect="15 Fuzzy atomic space analysis"),
+            CommandStep("4", expect="4 Calculate localization"),
+            WaitProgress(self._max_wait),
+            CommandStep("n", expect="y/n"),
+            CommandStep("0", expect="0 Return"),
+            CommandStep("q", expect="gracefully"),
+        ]
+        result = self.run_commands(commands, subdir="localization")
+        localization = self._parse_localization_values(result.stdout)
+
+        self._results.localization = localization
+        return localization
+
     def _parse_atomic_table(
         self,
         stdout: str,
@@ -1429,6 +1628,12 @@ class Multiwfn:
         """
         lines = stdout.split("\n")
         result: dict[str, dict[int, float]] = {key: {} for key in keys}
+        row_pattern = re.compile(
+            (
+                rf"\s*(\d+)\([A-Za-z][a-z]?\s*\)?\s+({NUMBER_PATTERN})\s+"
+                rf"({NUMBER_PATTERN})\s+({NUMBER_PATTERN})\s+({NUMBER_PATTERN})"
+            )
+        )
 
         for i, line in enumerate(lines):
             if all(keyword in line for keyword in header_keywords):
@@ -1440,10 +1645,7 @@ class Multiwfn:
                     if stop_keyword and stop_keyword in data_line:
                         break
                     # Parse format: "     1(C        val1        val2        val3        val4"
-                    match = re.match(
-                        r"\s*(\d+)\([A-Z][a-z]?\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
-                        data_line,
-                    )
+                    match = row_pattern.match(data_line)
                     if match:
                         atom_idx = int(match.group(1))
                         for k, key in enumerate(keys, start=2):
@@ -1451,6 +1653,15 @@ class Multiwfn:
                 break
 
         return result
+
+    def _raise_if_single_determinant_wavefunction_error(
+        self, stdout: str, analysis: str
+    ) -> None:
+        """Raise a clear error for unsupported multi-determinant wavefunctions."""
+        if SINGLE_DETERMINANT_WFN_ERROR_PATTERN in stdout:
+            raise RuntimeError(
+                f"{analysis} failed: {SINGLE_DETERMINANT_WFN_ERROR_PATTERN}."
+            )
 
     def _parse_fukui(self, stdout: str) -> dict[str, dict[int, float]]:
         """Parse Fukui function descriptors from stdout."""
@@ -1475,15 +1686,19 @@ class Multiwfn:
         """Parse electric moments from stdout."""
         patterns = {
             "dipole_magnitude_au": (
-                r"Magnitude of dipole moment:\s*([-\d.]+)\s+a\.u\."
+                rf"Magnitude of dipole moment:\s*({NUMBER_PATTERN})\s+a\.u\."
             ),
             "quadrupole_traceless_magnitude": (
-                r"Magnitude of the traceless quadrupole moment tensor:\s*([-\d.]+)"
+                rf"Magnitude of the traceless quadrupole moment tensor:\s*({NUMBER_PATTERN})"
             ),
-            "quadrupole_spherical_magnitude": r"Magnitude: \|Q_2\|=\s*([-\d.]+)",
-            "octopole_spherical_magnitude": r"Magnitude: \|Q_3\|=\s*([-\d.]+)",
+            "quadrupole_spherical_magnitude": (
+                rf"Magnitude: \|Q_2\|=\s*({NUMBER_PATTERN})"
+            ),
+            "octopole_spherical_magnitude": (
+                rf"Magnitude: \|Q_3\|=\s*({NUMBER_PATTERN})"
+            ),
             "electronic_spatial_extent": (
-                r"Electronic spatial extent <r\^2>:\s*([-\d.]+)"
+                rf"Electronic spatial extent <r\^2>:\s*({NUMBER_PATTERN})"
             ),
         }
 
@@ -1491,9 +1706,146 @@ class Multiwfn:
         for key, pattern in patterns.items():
             match = re.search(pattern, stdout)
             if match:
-                moments[key] = float(match.group(1))
+                moments[key] = self._parse_float(match.group(1))
 
         return moments
+
+    def _parse_homo_lumo_gap(self, stdout: str) -> dict[str, float | int]:
+        """Parse eV-based HOMO/LUMO energies and HOMO-LUMO gap from stdout."""
+        homo_match = HOMO_LINE_PATTERN.search(stdout)
+        lumo_match = LUMO_LINE_PATTERN.search(stdout)
+        gap_match = HOMO_LUMO_GAP_PATTERN.search(stdout)
+
+        if homo_match is None or lumo_match is None or gap_match is None:
+            raise RuntimeError("Could not parse HOMO/LUMO energies and HOMO-LUMO gap.")
+
+        return {
+            "homo_index": int(homo_match.group(1)),
+            "homo_energy_ev": self._parse_float(homo_match.group(2)),
+            "lumo_index": int(lumo_match.group(1)),
+            "lumo_energy_ev": self._parse_float(lumo_match.group(2)),
+            "homo_lumo_gap_ev": self._parse_float(gap_match.group(1)),
+        }
+
+    def _parse_somo_gaps(
+        self, stdout: str, occupation_thresholds: tuple[float, float] = (0.5, 1.5)
+    ) -> dict[str, Any]:
+        """Parse orbital list and compute eV-based SOMO gaps."""
+        orbitals = self._parse_orbital_list(stdout)
+        return self._compute_somo_gaps(orbitals, occupation_thresholds)
+
+    def _compute_somo_gaps(
+        self,
+        orbitals: list[dict[str, Any]],
+        occupation_thresholds: tuple[float, float] = (0.5, 1.5),
+    ) -> dict[str, Any]:
+        """Compute eV-based SOMO-related energy gaps from parsed orbital rows."""
+        lower, upper = self._validate_occupation_thresholds(occupation_thresholds)
+        unoccupied, somos, occupied = self._split_orbitals_by_occupation(
+            orbitals, lower, upper
+        )
+        if not occupied or not unoccupied:
+            raise RuntimeError(
+                "Could not identify doubly occupied and unoccupied orbitals."
+            )
+        if not somos:
+            raise RuntimeError("No partially occupied orbitals (SOMOs) were found.")
+
+        overall_homo = max(occupied, key=lambda orb: orb["energy_ev"])
+        overall_lumo = min(unoccupied, key=lambda orb: orb["energy_ev"])
+
+        sorted_somos = sorted(somos, key=lambda orb: orb["index"])
+        somo_indices = [somo["index"] for somo in sorted_somos]
+        somo_to_lumo_gap_ev: dict[int, float] = {}
+        somo_to_homo_gap_ev: dict[int, float] = {}
+
+        for somo in sorted_somos:
+            somo_idx = somo["index"]
+            somo_to_lumo_gap_ev[somo_idx] = (
+                overall_lumo["energy_ev"] - somo["energy_ev"]
+            )
+            somo_to_homo_gap_ev[somo_idx] = (
+                somo["energy_ev"] - overall_homo["energy_ev"]
+            )
+
+        return {
+            "overall_homo_index": int(overall_homo["index"]),
+            "overall_homo_energy_ev": overall_homo["energy_ev"],
+            "overall_lumo_index": int(overall_lumo["index"]),
+            "overall_lumo_energy_ev": overall_lumo["energy_ev"],
+            "somo_indices": somo_indices,
+            "somo_to_lumo_gap_ev": somo_to_lumo_gap_ev,
+            "somo_to_homo_gap_ev": somo_to_homo_gap_ev,
+            "occupation_thresholds": {"lower": lower, "upper": upper},
+        }
+
+    def _build_homo_window_gaps(
+        self,
+        orbitals: list[dict[str, Any]],
+        n: int = 3,
+        occupation_thresholds: tuple[float, float] = (0.5, 1.5),
+    ) -> dict[str, Any]:
+        """Build HOMO-centered gap sequence with a symmetric index window."""
+        lower, upper = self._validate_occupation_thresholds(occupation_thresholds)
+        if n < 0:
+            raise ValueError("Gap window n must be >= 0.")
+
+        if not orbitals:
+            raise RuntimeError("No orbitals available for gap analysis.")
+
+        _, _, occupied = self._split_orbitals_by_occupation(orbitals, lower, upper)
+        if not occupied:
+            raise RuntimeError("Could not identify doubly occupied orbitals.")
+
+        homo = max(occupied, key=lambda orb: orb["energy_ev"])
+        homo_index = homo["index"]
+
+        orbital_table: dict[int, tuple[float, float, str]] = {}
+        for orb in orbitals:
+            idx = orb["index"]
+            orbital_table[idx] = (
+                orb["energy_ev"],
+                orb["occupation"],
+                orb["type"],
+            )
+
+        sorted_indices = sorted(orbital_table)
+        start_idx = max(sorted_indices[0], homo_index - n)
+        end_idx = min(sorted_indices[-1], homo_index + n)
+
+        sequence_ev: list[dict[tuple[int, int], float]] = []
+        for idx in range(start_idx, end_idx):
+            if idx not in orbital_table or (idx + 1) not in orbital_table:
+                continue
+            gap_ev = orbital_table[idx + 1][0] - orbital_table[idx][0]
+            sequence_ev.append({(idx, idx + 1): gap_ev})
+
+        return {
+            "orbitals": orbital_table,
+            "gaps": {
+                "homo_index": homo_index,
+                "homo_energy_ev": homo["energy_ev"],
+                "sequence_ev": sequence_ev,
+            },
+        }
+
+    def _parse_orbital_list(self, stdout: str) -> list[dict[str, Any]]:
+        """Parse orbital listing from `List all orbitals` output."""
+        orbitals: list[dict[str, Any]] = []
+        for match in ORBITAL_LINE_PATTERN.finditer(stdout):
+            orbitals.append(
+                {
+                    "index": int(match.group(1)),
+                    "energy_ev": self._parse_float(match.group(2)),
+                    "occupation": self._parse_float(match.group(3)),
+                    "type": match.group(4),
+                }
+            )
+
+        if not orbitals:
+            raise RuntimeError("Could not parse orbital listing from stdout.")
+
+        return orbitals
 
     def _parse_chg_file(self, chg_path: Path) -> dict[int, float]:
         """Parse .chg file to {atom_idx: charge}."""
@@ -1513,6 +1865,7 @@ class Multiwfn:
         """Parse fuzzy atomic space integration values from stdout."""
         lines = stdout.split("\n")
         atomic_values: dict[int, float] = {}
+        value_pattern = NUMBER_PATTERN
 
         for i, line in enumerate(lines):
             if "Atomic space" in line and "Value" in line:
@@ -1522,21 +1875,53 @@ class Multiwfn:
                         break
                     # Parse format: "    1(C )            0.00607663"
                     match = re.match(
-                        r"\s*(\d+)\([A-Z][a-z]?\s*\)\s+([\d.-]+)", data_line
+                        rf"\s*(\d+)\([A-Z][a-z]?\s*\)\s+({value_pattern})",
+                        data_line,
                     )
                     if match:
                         atom_idx = int(match.group(1))
-                        value = float(match.group(2))
+                        value = self._parse_float(match.group(2))
                         atomic_values[atom_idx] = value
                 break
 
         return atomic_values
 
+    def _parse_localization_values(self, stdout: str) -> dict[int, float]:
+        """Parse wrapped localization index output from stdout."""
+        localization: dict[int, float] = {}
+        in_section = False
+        atom_value_pattern = re.compile(
+            r"(\d+)\([A-Z][a-z]?\s*\)\s*:\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)"
+        )
+
+        for line in stdout.splitlines():
+            if not in_section:
+                if "Localization index" in line:
+                    in_section = True
+                continue
+
+            if not line.strip():
+                if localization:
+                    break
+                continue
+
+            matches = list(atom_value_pattern.finditer(line))
+            if not matches:
+                if localization:
+                    break
+                continue
+
+            for match in matches:
+                atom_idx = int(match.group(1))
+                localization[atom_idx] = self._parse_float(match.group(2))
+
+        return localization
+
     def _parse_bond_orders(self, stdout: str) -> dict[tuple[int, int], float]:
         """Parse bond order matrix from Multiwfn output."""
         bond_orders: dict[tuple[int, int], float] = {}
         atom_pattern = re.compile(r"(\d+)\([A-Z][a-z]?\s*\)")
-        float_pattern = re.compile(r"[-+]?(?:\d*\.\d+|\d+)")
+        float_pattern = re.compile(NUMBER_PATTERN)
 
         for line in stdout.splitlines():
             atom_matches = list(atom_pattern.finditer(line))
@@ -1737,7 +2122,7 @@ class Multiwfn:
 
     @staticmethod
     def _parse_first_number(text: str) -> float | None:
-        match = re.search(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?", text)
+        match = re.search(NUMBER_PATTERN, text)
         if match:
             return float(match.group(0))
         return None
@@ -1767,8 +2152,14 @@ class Multiwfn:
             if maxima_match:
                 data["statistics"]["num_maxima"] = int(maxima_match.group(1))
 
-            extrema_pattern = r"[\*\s]+\d+\s+([\d.]+)\s+[\d.-]+\s+[\d.-]+"
-            matches = re.findall(extrema_pattern, content)
+            extrema_pattern = re.compile(
+                (
+                    rf"^\s*\*?\s*\d+\s+({NUMBER_PATTERN})\s+{NUMBER_PATTERN}\s+"
+                    rf"{NUMBER_PATTERN}\b"
+                ),
+                flags=re.MULTILINE,
+            )
+            matches = extrema_pattern.findall(content)
 
             if matches:
                 extrema_values = [float(m) for m in matches]
