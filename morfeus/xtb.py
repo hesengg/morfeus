@@ -904,11 +904,12 @@ class XTB:
             RuntimeError: If the xtb calculation failed
         """
         # Set xtb command
+        arguments_xtb_command = ""
+
         runtypes = ["sp", "ipea", "fukui", "fod", "molden", "density", "spin density"]
         if runtype == "sp":
-            command = self._default_xtb_command
             if self._solvent is not None:
-                command += f" --input {XTB._xtb_input_file}"
+                self._default_xtb_command += f" --input {XTB._xtb_input_file}"
         elif self._method == "ptb":
             raise ValueError(
                 "PTB can only be used for calculations of bond orders, charges, dipole, "
@@ -916,21 +917,20 @@ class XTB:
                 "For other descriptors, choose another xtb method."
             )
         elif runtype == "ipea":
-            command = self._default_xtb_command + " --vipea"
+            arguments_xtb_command = " --vipea"
         elif runtype == "fukui":
-            command = self._default_xtb_command + " --vfukui"
+            arguments_xtb_command = " --vfukui"
         elif runtype == "fod":
-            command = self._default_xtb_command + " --fod"
+            arguments_xtb_command = " --fod"
         elif runtype == "molden":
-            command = self._default_xtb_command + " --molden"
+            arguments_xtb_command = " --molden"
         elif runtype == "density":
-            command = self._default_xtb_command
+            pass
         elif runtype == "spin density":
             if self._n_unpaired == 0:
                 raise ValueError(
                     "Spin density calculation requires unpaired electrons."
                 )
-            command = self._default_xtb_command
         else:
             raise ValueError(
                 f"Runtype {runtype!r} does not exist. Choose one of {', '.join(runtypes)}."
@@ -957,6 +957,7 @@ class XTB:
 
             self._make_xtb_inp(run_folder, runtype)
 
+            command = self._default_xtb_command + arguments_xtb_command
             # Run xtb
             with open(run_folder / "xtb.out", "w") as stdout, open(
                 run_folder / "xtb.err", "w"
