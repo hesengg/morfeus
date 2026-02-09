@@ -12,13 +12,18 @@ import re
 import shutil
 import tempfile
 import time
+from types import TracebackType
 from typing import Any, cast, Iterable
 
 import pexpect
 
 from morfeus.utils import build_execution_env, requires_executable
 
-REAL_SPACE_FUNCTIONS = {
+RealFunctionSetting = int | tuple[int, str]
+VectorFunctionSetting = tuple[int, int, int] | tuple[tuple[int, int, int], str]
+
+
+REAL_SPACE_FUNCTIONS: dict[str, str] = {
     "rho": "1 Electron density",
     "rho_grad_norm": "2 Gradient norm of rho",
     "rho_lapl": "3 Laplacian of rho",
@@ -48,7 +53,7 @@ REAL_SPACE_FUNCTIONS = {
 }
 
 
-USER_REAL_FUNCTIONS = {
+USER_REAL_FUNCTIONS: dict[str, RealFunctionSetting] = {
     "alpha_density": 1,  # open
     "beta_density": 2,  # open
     "spatial_extent_integrand_r2rho": 3,
@@ -154,7 +159,7 @@ USER_REAL_FUNCTIONS = {
     #
 }
 
-VECTORS = {
+VECTORS: dict[str, VectorFunctionSetting] = {
     "coordinates": (900, 901, 902),
     "dipole_integrand_minus": (21, 22, 23),
     "electron_linear_momentum": (71, 72, 73),
@@ -163,7 +168,7 @@ VECTORS = {
     "lagrangian_kinetic_energy": (84, 85, 86),
 }
 
-USER_REAL_FUNCTIONS_EXPENSIVE = {
+USER_REAL_FUNCTIONS_EXPENSIVE: set[str] = {
     "electron_esp_Vele",
     "avg_local_esp",
     "electrostatic_potential_excluding_nucleus_K",
@@ -184,11 +189,53 @@ USER_REAL_FUNCTIONS_EXPENSIVE = {
     "steric_charge",
 }
 
-ALL_FUNCTIONS = (
+ALL_FUNCTIONS: set[str] = (
     set(REAL_SPACE_FUNCTIONS.keys())
     | set(USER_REAL_FUNCTIONS.keys())
     | set(VECTORS.keys())
 )
+FAST_FUNCTIONS: set[str] = ALL_FUNCTIONS - USER_REAL_FUNCTIONS_EXPENSIVE
+
+CHARGE_MODELS: dict[str, str] = {
+    "hirshfeld": "1 Hirshfeld atomic",
+    "vdd": "2 Voronoi deformation density",
+    "mulliken": "5 Mulliken atom & basis function",
+    "adch": "11 Atomic dipole corrected Hirshfeld",
+    "cm5": "16 CM5 atomic charge",
+    "12cm5": "-16 Generate 1.2",
+}
+
+CHARGE_MODEL_CITATIONS: dict[str, str] = {
+    "hirshfeld": "Theor. Chim. Acta. (Berl), 44, 129-138 (1977)",
+    "vdd": "J. Comput. Chem., 25, 189.",
+    "adch": (
+        "Tian Lu, Feiwu Chen, Atomic dipole moment corrected Hirshfeld population "
+        "method, J. Theor. Comput. Chem., 11, 163 (2012)"
+    ),
+}
+
+SURFACE_MODELS: dict[str, str] = {
+    "esp": "1 Electrostatic potential",
+    "alie": "2 Average local ionization energy",
+    "lea": "4 Local electron affinity",
+    "leae": "-4 Local electron attachment energy",
+    "electron": "11 Electron density",
+    "sign": "12 Sign",
+}
+
+BOND_ORDER_MODELS: dict[str, str] = {
+    "mayer": "1 Mayer bond order analysis",
+    "wiberg": "3 Wiberg bond order analysis in Lowdin orthogonalized basis",
+    "mulliken": "4 Mulliken bond order",
+    "fuzzy": "7 Fuzzy bond order analysis",
+    "laplacian": "8 Laplacian bond order",
+}
+
+GRID_QUALITIES: dict[str, str] = {
+    "low": "1 Low quality grid",
+    "medium": "2 Medium quality grid",
+    "high": "3 High quality grid",
+}
 
 
 @dataclass
@@ -239,7 +286,7 @@ class MultiwfnResults:
     charges: dict[str, dict[int, float]] | None = None
     surfaces: dict[str, dict[str, Any]] | None = None
     atomic_descriptors: dict[str, dict[int, float]] | None = None
-    grid_descriptors: dict[int, float] | None = None
+    grid_descriptors: dict[str, dict[int, float]] | None = None
     electric_moments: dict[str, float] | None = None
     bond_orders: dict[str, dict[tuple[int, int], float]] | None = None
     fukui: dict[str, dict[int, float]] | None = None
@@ -551,7 +598,9 @@ class Multiwfn:
         debug: If True, print debug info including sent commands and expect patterns.
         env_variables: Environment variables to use for the Multiwfn process.
         max_wait: Maximum time to wait for progress updates in seconds.
-        has_spin: Spin state. If None, detect from file (True=open-shell, False=closed-shell).
+        has_spin: Spin state. If None, detect from file for wavefunction inputs
+            (True=open-shell, False=closed-shell). For .cub/.grd inputs, spin
+            state is left undefined.
     """
 
     def __init__(
@@ -591,7 +640,12 @@ class Multiwfn:
             ),
             "Tian Lu, J. Chem. Phys., 161, 082503 (2024) DOI: 10.1063/5.0216272",
         }
-        self._has_spin = has_spin if has_spin is not None else self._detect_spin_state()
+        self._has_spin = has_spin
+        if self._has_spin is None and self._file_path.suffix.lower() not in {
+            ".cub",
+            ".grd",
+        }:
+            self._has_spin = self._detect_spin_state()
 
     def _detect_spin_state(self) -> bool:
         """Load the molden file and parse the multiplicity."""
@@ -630,6 +684,18 @@ class Multiwfn:
             self._temp_dir.cleanup()
             self._temp_dir = None
 
+    def __enter__(self) -> "Multiwfn":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
     def __del__(self) -> None:
         try:
             self.close()
@@ -667,6 +733,44 @@ class Multiwfn:
             ),
         ]
 
+    def _build_fuzzy_integration_commands(
+        self,
+        menu_cmd: str,
+        menu_pattern: str,
+        prefix_commands: list[CommandStep] | None = None,
+    ) -> list[CommandStep | WaitProgress]:
+        """Build command sequence for fuzzy atomic space integration."""
+        commands: list[CommandStep | WaitProgress] = list(prefix_commands or [])
+        commands.extend(
+            [
+                CommandStep("15", expect="15 Fuzzy atomic space analysis"),
+                CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
+                CommandStep(menu_cmd, expect=menu_pattern),
+                WaitProgress(self._max_wait),
+                CommandStep("0", expect="0 Return"),
+                CommandStep("q", expect="gracefully"),
+            ]
+        )
+        return commands
+
+    @staticmethod
+    def _parse_user_function(
+        function_setting: RealFunctionSetting,
+    ) -> tuple[int, str | None]:
+        """Parse a user-defined scalar function setting."""
+        if isinstance(function_setting, tuple):
+            return function_setting
+        return function_setting, None
+
+    def _parse_vector_functions(self, descriptor: str) -> tuple[int, int, int]:
+        """Parse vector function settings and cache citation if present."""
+        vector_setting = VECTORS[descriptor]
+        if len(vector_setting) == 2 and isinstance(vector_setting[1], str):
+            functions = vector_setting[0]
+            self._results.citations.add(vector_setting[1])
+            return functions
+        return vector_setting
+
     def _setup_workdir(self, subdir: str | None) -> Path:
         """Get or create working directory."""
         workdir = self._run_path / subdir if subdir else self._run_path
@@ -679,6 +783,26 @@ class Multiwfn:
     def _set_env(self) -> dict[str, str]:
         """Set environment variables for Multiwfn execution."""
         return build_execution_env(env_variables=self._env_variables)
+
+    @staticmethod
+    def _normalize_option(value: str) -> str:
+        """Normalize option keys to lower-case."""
+        return value.strip().lower()
+
+    def list_options(self) -> dict[str, list[str]]:
+        """List available option names for common Multiwfn analyses."""
+        return {
+            "charges": sorted(CHARGE_MODELS),
+            "surface": sorted(SURFACE_MODELS),
+            "bond_order": sorted(BOND_ORDER_MODELS),
+            "grid_quality": sorted(GRID_QUALITIES),
+            "descriptors": sorted(ALL_FUNCTIONS),
+            "descriptors_fast": sorted(FAST_FUNCTIONS),
+        }
+
+    def get_citations(self) -> list[str]:
+        """Get all collected citations for the current object."""
+        return sorted(self._results.citations)
 
     @requires_executable(["Multiwfn"])
     def run_commands(
@@ -712,17 +836,17 @@ class Multiwfn:
             workdir=workdir,
         )
 
-    def get_charges(self, model: str = "ADCH") -> dict[int, float]:
+    def get_charges(self, model: str = "adch") -> dict[int, float]:
         """Calculate atomic charges.
 
         Args:
             model: Charge model to use.
-                - 'Hirshfeld': Standard Hirshfeld charges
-                - 'ADCH': Atomic dipole moment corrected Hirshfeld charges (more accurate)
-                - 'VDD': Voronoi deformation density
-                - 'Mulliken': Mulliken charges
-                - 'CM5': CM5 charges
-                - '12CM5': 1.2*CM5 charges
+                - 'hirshfeld': Standard Hirshfeld charges
+                - 'adch': Atomic dipole moment corrected Hirshfeld charges
+                - 'vdd': Voronoi deformation density
+                - 'mulliken': Mulliken charges
+                - 'cm5': CM5 charges
+                - '12cm5': 1.2*CM5 charges
 
         Raises:
             ValueError: If given charge model is not available.
@@ -730,33 +854,20 @@ class Multiwfn:
         Returns:
             Atomic charges indexed by atom number (1-indexed)
         """
-        if self._results.charges is not None and model in self._results.charges:
-            return self._results.charges[model]
+        normalized_model = self._normalize_option(model)
+        if (
+            self._results.charges is not None
+            and normalized_model in self._results.charges
+        ):
+            return self._results.charges[normalized_model]
 
-        models = {
-            "Hirshfeld": "1 Hirshfeld atomic",
-            "VDD": "2 Voronoi deformation density",
-            "Mulliken": "5 Mulliken atom & basis function",
-            "ADCH": "11 Atomic dipole corrected Hirshfeld",
-            "CM5": "16 CM5 atomic charge",
-            "12CM5": "-16 Generate 1.2*CM5",
-        }
-        citations = {
-            "Hirshfeld": "Theor. Chim. Acta. (Berl), 44, 129-138 (1977)",
-            "VDD": "J. Comput. Chem., 25, 189.",
-            "ADCH": (
-                "Tian Lu, Feiwu Chen, Atomic dipole moment corrected Hirshfeld "
-                "population method, J. Theor. Comput. Chem., 11, 163 (2012)"
-            ),
-        }
-
-        if model not in models:
-            choices = ", ".join(models.keys())
+        if normalized_model not in CHARGE_MODELS:
+            choices = ", ".join(CHARGE_MODELS.keys())
             raise ValueError(
                 f"Charge model {model!r} not supported. Choose between {choices}."
             )
 
-        menu_pattern = models[model]
+        menu_pattern = CHARGE_MODELS[normalized_model]
         menu_cmd = menu_pattern.split(" ")[0]
 
         commands = [
@@ -766,21 +877,24 @@ class Multiwfn:
                 "1",
                 expect=(
                     "1 Use build-in sphericalized atomic"
-                    if model != "Mulliken"
+                    if normalized_model != "mulliken"
                     else " 1 Output Mulliken population and atomic"
                 ),
             ),
-            CommandStep("y", expect="charges to molden.chg"),
-            CommandStep("0", expect="Mulliken population analysis", optional=True),
+            CommandStep("y", expect="y/n"),
+        ]
+        if normalized_model == "mulliken":
+            commands += [CommandStep("0", expect="Mulliken population")]
+        commands += [
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
         ]
 
-        citation = citations.get(model, None)
+        citation = CHARGE_MODEL_CITATIONS.get(normalized_model, None)
         if citation is not None:
             self._results.citations.add(citation)
 
-        result = self.run_commands(commands, subdir=model)
+        result = self.run_commands(commands, subdir=normalized_model)
 
         chg_files = sorted(result.workdir.glob("*.chg"))
         if not chg_files:
@@ -790,21 +904,21 @@ class Multiwfn:
 
         if self._results.charges is None:
             self._results.charges = {}
-        self._results.charges[model] = charges
+        self._results.charges[normalized_model] = charges
 
         return charges
 
-    def get_surface(self, model: str = "ESP") -> dict[str, Any]:
+    def get_surface(self, model: str = "esp") -> dict[str, Any]:
         """Calculate molecular surface properties.
 
         Args:
             model: Surface analysis model to use.
-                - 'ESP': Electrostatic Potential
-                - 'ALIE': Average Local Ionization Energy
-                - 'LEA': Local Electron Affinity
-                - 'LEAE': Local Electron Attachment Energy
-                - 'Electron': Electron Density
-                - 'Sign': Sign(lambda2)*rho
+                - 'esp': Electrostatic Potential
+                - 'alie': Average Local Ionization Energy
+                - 'lea': Local Electron Affinity
+                - 'leae': Local Electron Attachment Energy
+                - 'electron': Electron Density
+                - 'sign': Sign(lambda2)*rho
 
         Raises:
             ValueError: If given model is not available.
@@ -819,24 +933,19 @@ class Multiwfn:
                 - 'global': Dict with global surface statistics
                     - surface_area, volume, average, variance, minimum, maximum
         """
-        if self._results.surfaces is not None and model in self._results.surfaces:
-            return self._results.surfaces[model]
+        normalized_model = self._normalize_option(model)
+        if (
+            self._results.surfaces is not None
+            and normalized_model in self._results.surfaces
+        ):
+            return self._results.surfaces[normalized_model]
 
-        models = {
-            "ESP": "1 Electrostatic potential",
-            "ALIE": "2 Average local ionization energy",
-            "LEA": "4 Local electron affinity",
-            "LEAE": "-4 Local electron attachment energy",
-            "Electron": "11 Electron density",
-            "Sign": "12 Sign",
-        }
-
-        if model not in models:
-            choices = ", ".join(models.keys())
+        if normalized_model not in SURFACE_MODELS:
+            choices = ", ".join(SURFACE_MODELS.keys())
             raise ValueError(
                 f"Surface model {model!r} not supported. Choose between {choices}."
             )
-        menu_pattern = models[model]
+        menu_pattern = SURFACE_MODELS[normalized_model]
         menu_cmd = menu_pattern.split(" ")[0]
 
         self._results.citations.add(
@@ -852,13 +961,13 @@ class Multiwfn:
             CommandStep("0", expect="0 Start analysis"),
             WaitProgress(self._max_wait),
             CommandStep("11", expect="11 Output surface properties"),
-            CommandStep("n", expect="surface facets to locsurf.pqr"),
+            CommandStep("n", expect="surface facets to locsurf"),
             CommandStep("-1", expect="-1 Return to upper level"),
             CommandStep("-1", expect="-1 Return to main menu"),
             CommandStep("q", expect="Exit program gracefully"),
         ]
 
-        result = self.run_commands(commands, subdir=model)
+        result = self.run_commands(commands, subdir=normalized_model)
 
         atomic_props = self._parse_atomic_surface_properties(result.stdout)
         global_props = self._parse_global_surface_properties(result.stdout)
@@ -866,7 +975,7 @@ class Multiwfn:
 
         if self._results.surfaces is None:
             self._results.surfaces = {}
-        self._results.surfaces[model] = surface_result
+        self._results.surfaces[normalized_model] = surface_result
 
         return surface_result
 
@@ -882,28 +991,23 @@ class Multiwfn:
         Raises:
             ValueError: If given bond order model is not available.
         """
-        if self._results.bond_orders is not None and model in self._results.bond_orders:
-            return self._results.bond_orders[model]
+        normalized_model = self._normalize_option(model)
+        if (
+            self._results.bond_orders is not None
+            and normalized_model in self._results.bond_orders
+        ):
+            return self._results.bond_orders[normalized_model]
 
-        bond_orders = {
-            "mayer": "1 Mayer bond order analysis",
-            "wiberg": "3 Wiberg bond order analysis in Lowdin orthogonalized basis",
-            "wilberg": "3 Wiberg bond order analysis in Lowdin orthogonalized basis",
-            "mulliken": "4 Mulliken bond order (Mulliken overlap population) analysis",
-            "fuzzy": "7 Fuzzy bond order analysis (FBO)",
-            "laplacian": "8 Laplacian bond order (LBO)",
-        }
-
-        if model not in bond_orders:
-            choices = ", ".join(sorted(bond_orders.keys()))
+        if normalized_model not in BOND_ORDER_MODELS:
+            choices = ", ".join(sorted(BOND_ORDER_MODELS.keys()))
             raise ValueError(
                 "Bond order type " f"{model!r} not supported. Choose between {choices}."
             )
 
-        menu_pattern = bond_orders[model]
+        menu_pattern = BOND_ORDER_MODELS[normalized_model]
         menu_cmd = menu_pattern.split(" ")[0]
 
-        if model == "laplacian":
+        if normalized_model == "laplacian":
             self._results.citations.add(
                 "Tian Lu and Feiwu Chen, Bond Order Analysis Based on the Laplacian of "
                 "Electron Density in Fuzzy Overlap Space, J. Phys. Chem. A, 117, "
@@ -912,18 +1016,18 @@ class Multiwfn:
         commands = [
             CommandStep("9", expect="9 Bond order analysis"),
             CommandStep(menu_cmd, expect=menu_pattern),
-            WaitProgress(self._max_wait),
-            CommandStep("n", expect="outputting bond order matrix"),
+            # WaitProgress(self._max_wait),
+            CommandStep("n", expect="current folder"),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
         ]
 
-        result = self.run_commands(commands, subdir=model)
+        result = self.run_commands(commands, subdir=normalized_model)
         bond_order_matrix = self._parse_bond_orders(result.stdout)
 
         if self._results.bond_orders is None:
             self._results.bond_orders = {}
-        self._results.bond_orders[model] = bond_order_matrix
+        self._results.bond_orders[normalized_model] = bond_order_matrix
 
         return bond_order_matrix
 
@@ -933,7 +1037,8 @@ class Multiwfn:
         """Calculate atomic densities from integration in fuzzy atomic spaces.
 
         Args:
-            grid_path: Path to a grid file in .cub or .grd. If None, the objects's file_path will be used.
+            grid_path: Path to a grid file in .cub or .grd. If None, use the
+                object's file_path.
             userfunction: User-defined function index for integration.
 
         Returns:
@@ -943,35 +1048,44 @@ class Multiwfn:
             ValueError: If input file is not a cube/grid file.
         """
         grids = {".cub", ".grd"}
-        grid_path = Path(grid_path)
-        if (
-            grid_path.suffix.lower() not in grids
-            and self._file_path.suffix.lower() not in grids
-        ):
+        grid_file = Path(grid_path).resolve() if grid_path is not None else None
+        input_is_grid = (
+            grid_file is not None and grid_file.suffix.lower() in grids
+        ) or self._file_path.suffix.lower() in grids
+        if not input_is_grid:
             raise ValueError("Density analysis requires a .cub or .grd file as input.")
 
+        active_grid = (
+            grid_file
+            if grid_file is not None and grid_file.exists()
+            else self._file_path
+        )
+        grid_key = str(active_grid)
+        if (
+            self._results.grid_descriptors is not None
+            and grid_key in self._results.grid_descriptors
+        ):
+            return self._results.grid_descriptors[grid_key]
+
         file_path = self._file_path
-        if grid_path is not None and grid_path.exists():
-            self._file_path = grid_path.resolve()
+        try:
+            if active_grid != self._file_path:
+                self._file_path = active_grid
 
-        if self._results.grid_descriptors is not None:
-            return self._results.grid_descriptors
-
-        commands = self._commands_change_iuserfunc(function=userfunction) + [
-            CommandStep("15", expect="15 Fuzzy atomic space analysis"),
-            CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
-            CommandStep("100", expect="100 User-defined function"),
-            WaitProgress(self._max_wait),
-            CommandStep("0", expect="0 Return"),
-            CommandStep("q", expect="Exit program gracefully"),
-        ]
-
-        result = self.run_commands(commands, subdir="grid")
-        self._file_path = file_path  # Restore original file path after analysis
+            commands = self._build_fuzzy_integration_commands(
+                "100",
+                "100 User-defined function",
+                prefix_commands=self._commands_change_iuserfunc(function=userfunction),
+            )
+            result = self.run_commands(commands, subdir="grid")
+        finally:
+            self._file_path = file_path
 
         grid_descriptors = self._parse_atomic_values(result.stdout)
 
-        self._results.grid_descriptors = grid_descriptors
+        if self._results.grid_descriptors is None:
+            self._results.grid_descriptors = {}
+        self._results.grid_descriptors[grid_key] = grid_descriptors
         return grid_descriptors
 
     def get_grid(
@@ -993,20 +1107,19 @@ class Multiwfn:
         Raises:
             ValueError: If the descriptor is not supported.
         """
-        try:
-            menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
-        except ValueError as e:
-            raise e
+        menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
 
-        grids = {
-            "low": "1 Low quality grid",
-            "medium": "2 Medium quality grid",
-            "high": "3 High quality grid",
-        }
-        grid_pattern = grids[grid_quality]
+        normalized_grid_quality = self._normalize_option(grid_quality)
+        if normalized_grid_quality not in GRID_QUALITIES:
+            choices = ", ".join(GRID_QUALITIES.keys())
+            raise ValueError(
+                f"Grid quality {grid_quality!r} not supported. Choose between {choices}."
+            )
+        grid_pattern = GRID_QUALITIES[normalized_grid_quality]
         grid_cmd = grid_pattern.split(" ")[0]
 
-        commands += [
+        grid_commands: list[CommandStep | WaitProgress] = [
+            *commands,
             CommandStep(
                 "5",
                 expect="5 Output and plot specific property within a spatial region",
@@ -1018,7 +1131,7 @@ class Multiwfn:
             CommandStep("0", expect="0 Return to main menu"),
             CommandStep("q", expect="gracefully"),
         ]
-        result = self.run_commands(commands, subdir=descriptor)
+        result = self.run_commands(grid_commands, subdir=descriptor)
 
         cub_file_path = next(f for f in result.workdir.iterdir() if f.suffix == ".cub")
         cub_file_path = cast(Path, cub_file_path)
@@ -1044,15 +1157,12 @@ class Multiwfn:
             grid_file_name: Optional name for output cube file.
 
         Returns:
-            Dictionary mapping descriptor name to {atom index: value}.
+            Dictionary mapping descriptor name to generated grid file path.
         """
-        grid_paths: dict[str, dict[int, float]] = {}
+        grid_paths: dict[str, Path] = {}
         for descriptor in descriptors:
-            try:
-                grid_path = self.get_grid(descriptor, grid_quality, grid_file_name)
-                grid_paths[descriptor] = grid_path
-            except ValueError as e:
-                print(f"[WARN] Skipping descriptor {descriptor!r}: {e}")
+            grid_path = self.get_grid(descriptor, grid_quality, grid_file_name)
+            grid_paths[descriptor] = grid_path
         return grid_paths
 
     def get_fukui(self) -> dict[str, dict[int, float]]:
@@ -1062,8 +1172,13 @@ class Multiwfn:
             Dictionary with all Fukui descriptors
 
         Raises:
-            ValueError: If the system is open-shell.
+            ValueError: If the system is open-shell or spin is undefined.
         """
+        if self._has_spin is None:
+            raise ValueError(
+                "Fukui function analysis requires known spin state. "
+                "Initialize Multiwfn with has_spin=True/False."
+            )
         if self._has_spin:
             raise ValueError("Fukui function analysis requires closed-shell.")
 
@@ -1074,7 +1189,7 @@ class Multiwfn:
             CommandStep("22", expect="22 Conceptual DFT"),
             CommandStep("6", expect="6 Calculate condensed OW Fukui"),
             WaitProgress(self._max_wait),
-            CommandStep("0", expect="0 Return"),
+            CommandStep("0", expect="Fukui potential"),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="fukui")
@@ -1091,8 +1206,13 @@ class Multiwfn:
             Dictionary with all superdelocalizability descriptors.
 
         Raises:
-            ValueError: If the system is open-shell.
+            ValueError: If the system is open-shell or spin is undefined.
         """
+        if self._has_spin is None:
+            raise ValueError(
+                "Superdelocalizability analysis requires known spin state. "
+                "Initialize Multiwfn with has_spin=True/False."
+            )
         if self._has_spin:
             raise ValueError("Superdelocalizability analysis requires closed-shell.")
 
@@ -1128,77 +1248,89 @@ class Multiwfn:
         if descriptor not in VECTORS:
             raise ValueError(f"Vector descriptor {descriptor!r} not supported")
 
-        if (
-            self._results.atomic_vector_descriptors is not None
-            and descriptor in self._results.atomic_vector_descriptors
-        ):
+        if self._results.atomic_vector_descriptors is None:
+            self._results.atomic_vector_descriptors = {}
+        elif descriptor in self._results.atomic_vector_descriptors:
             return self._results.atomic_vector_descriptors[descriptor]
-        try:
-            menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
-        except ValueError as e:
-            raise e
 
-        vectors = {}
-        for cs, d in zip(commands, ("x", "y", "z")):
-            label = f"{descriptor}_{d}"
-            result = self._run_fuzzy_integration(menu_cmd, menu_pattern, cs, label)
-            for i, j in result.items():
-                vectors[i] = vectors.get(i, []) + j
+        menu_cmd = "100"
+        menu_pattern = "100 User-defined function"
+        functions = self._parse_vector_functions(descriptor)
 
-        self._results.atomic_vector_descriptors[descriptor] = vectors
-        return vectors
+        vectors: dict[int, list[float]] = {}
+        for component_idx, (func, axis) in enumerate(zip(functions, ("x", "y", "z"))):
+            self._check_function_selection(func, descriptor)
+            label = f"{descriptor}_{axis}"
+            result = self._run_fuzzy_integration(
+                menu_cmd,
+                menu_pattern,
+                self._commands_change_iuserfunc(function=func),
+                label,
+            )
+            for atom_idx, value in result.items():
+                components = vectors.setdefault(atom_idx, [0.0, 0.0, 0.0])
+                components[component_idx] = value
 
-    def _check_function_selection(self, func: str, descriptor: str) -> None:
+        vectors_3d = {
+            atom_idx: (components[0], components[1], components[2])
+            for atom_idx, components in vectors.items()
+        }
+
+        self._results.atomic_vector_descriptors[descriptor] = vectors_3d
+        return vectors_3d
+
+    def _check_function_selection(self, func: int, descriptor: str) -> None:
+        closed_shell_only = {24, 34, 60, 61, 62, 1100}
+        open_shell_only = {1, 2, 1101, 1102}
+
+        if self._has_spin is None:
+            if func in closed_shell_only or func in open_shell_only:
+                raise ValueError(
+                    f"Descriptor {descriptor!r} requires known spin state. "
+                    "Initialize Multiwfn with has_spin=True/False."
+                )
+            return
+
         if self._has_spin:  # open-shell
-            if func in {24, 34, 60, 61, 62, 1100}:
+            if func in closed_shell_only:
                 raise ValueError(
                     f"Descriptor {descriptor!r} not available for open-shell systems."
                 )
         else:  # closed-shell
-            if func in {1, 2, 1101, 1102}:
+            if func in open_shell_only:
                 raise ValueError(
                     f"Descriptor {descriptor!r} not available for closed-shell systems."
                 )
 
     def _get_descriptor_function(
         self, descriptor: str
-    ) -> tuple[str, str, list[CommandStep] | dict[str, list[CommandStep]]]:
-
+    ) -> tuple[str, str, list[CommandStep]]:
         if descriptor not in ALL_FUNCTIONS:
             raise ValueError(f"Descriptor {descriptor!r} not supported.")
+        if descriptor in VECTORS:
+            raise ValueError(
+                f"Descriptor {descriptor!r} is vector-valued. Use get_vector() instead."
+            )
 
-        commands = []
+        commands: list[CommandStep] = []
 
         if descriptor in REAL_SPACE_FUNCTIONS:
-            menu_pattern = REAL_SPACE_FUNCTIONS.get(descriptor)
+            menu_pattern = REAL_SPACE_FUNCTIONS[descriptor]
             menu_cmd = menu_pattern.split(" ")[0]
 
             if menu_cmd in {"13"}:
                 raise ValueError(f"Descriptor {descriptor!r} requires grid data!")
 
-        elif descriptor in USER_REAL_FUNCTIONS:
-            func = USER_REAL_FUNCTIONS.get(descriptor)
-
-            if isinstance(func, tuple):
-                func, citation = func
+        else:
+            function_setting = USER_REAL_FUNCTIONS[descriptor]
+            func, citation = self._parse_user_function(function_setting)
+            if citation is not None:
                 self._results.citations.add(citation)
             menu_cmd = "100"
             menu_pattern = "100 User-defined function"
 
-            try:
-                self._check_function_selection(func, descriptor)
-            except ValueError as e:
-                raise e
-            commands += self._commands_change_iuserfunc(function=func)
-
-        elif descriptor in VECTORS:
-            funcs = USER_REAL_FUNCTIONS.get(descriptor)
-            if len(funcs) == 2:
-                funcs, citation = funcs
-                self._results.citations.add(citation)
-            commands = {func: self._commands_change_iuserfunc(func) for func in funcs}
-        else:
-            raise ValueError(f"Descriptor {descriptor!r} not supported.")
+            self._check_function_selection(func, descriptor)
+            commands.extend(self._commands_change_iuserfunc(function=func))
 
         return menu_cmd, menu_pattern, commands
 
@@ -1210,9 +1342,6 @@ class Multiwfn:
 
         Returns:
             Dictionary mapping atom index (1-based) to integrated density value.
-
-        Raises:
-            ValueError: If the descriptor is not supported for the system.
         """
         if (
             self._results.atomic_descriptors is not None
@@ -1220,16 +1349,14 @@ class Multiwfn:
         ):
             return self._results.atomic_descriptors[descriptor]
 
-        try:
-            menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
-        except ValueError as e:
-            raise e
+        menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
         descriptor_result = self._run_fuzzy_integration(
             menu_cmd, menu_pattern, commands, descriptor
         )
         if self._results.atomic_descriptors is None:
             self._results.atomic_descriptors = {}
         self._results.atomic_descriptors[descriptor] = descriptor_result
+        return descriptor_result
 
     def _run_fuzzy_integration(
         self,
@@ -1238,15 +1365,12 @@ class Multiwfn:
         commands: list[CommandStep],
         descriptor: str,
     ) -> dict[int, float]:
-        commands += [
-            CommandStep("15", expect="15 Fuzzy atomic space analysis"),
-            CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
-            CommandStep(menu_cmd, expect=menu_pattern),
-            WaitProgress(self._max_wait),
-            CommandStep("0", expect="0 Return"),
-            CommandStep("q", expect="gracefully"),
-        ]
-        result = self.run_commands(commands, subdir=descriptor)
+        command_sequence = self._build_fuzzy_integration_commands(
+            menu_cmd,
+            menu_pattern,
+            prefix_commands=commands,
+        )
+        result = self.run_commands(command_sequence, subdir=descriptor)
         descriptor_result = self._parse_atomic_values(result.stdout)
         return descriptor_result
 
@@ -1261,20 +1385,17 @@ class Multiwfn:
         """
         results: dict[str, dict[int, float]] = {}
         for descriptor in descriptors:
-            try:
-                result = self.get_descriptor(descriptor)
-                results[descriptor] = result
-            except ValueError as e:
-                print(f"[WARN] Skipping descriptor {descriptor!r}: {e}")
+            result = self.get_descriptor(descriptor)
+            results[descriptor] = result
         return results
 
-    def get_electric_moments(self) -> dict:
+    def get_electric_moments(self) -> dict[str, float]:
         """Calculate electric dipole/multipole moments."""
         if self._results.electric_moments is not None:
             return self._results.electric_moments
 
         commands = [
-            CommandStep("300", expect="300 Other functions (Part 3)"),
+            CommandStep("300", expect="300 Other functions"),
             CommandStep("5", expect="5 Calculate electric dipole/multipole moments"),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
@@ -1350,7 +1471,7 @@ class Multiwfn:
             stop_keyword="Sum of",
         )
 
-    def _parse_electric_moments(self, stdout: str) -> dict:
+    def _parse_electric_moments(self, stdout: str) -> dict[str, float]:
         """Parse electric moments from stdout."""
         patterns = {
             "dipole_magnitude_au": (
@@ -1366,7 +1487,7 @@ class Multiwfn:
             ),
         }
 
-        moments = {}
+        moments: dict[str, float] = {}
         for key, pattern in patterns.items():
             match = re.search(pattern, stdout)
             if match:
@@ -1474,7 +1595,10 @@ class Multiwfn:
         return atomic_props, len(lines)
 
     def _parse_atomic_averages(
-        self, lines: list[str], atomic_props: dict, start_idx: int
+        self,
+        lines: list[str],
+        atomic_props: dict[int, dict[str, float]],
+        start_idx: int,
     ) -> dict[int, dict[str, float]]:
         """Parse atomic surface averages section from stdout."""
         for i in range(start_idx + 1, len(lines)):
@@ -1501,7 +1625,10 @@ class Multiwfn:
         return atomic_props
 
     def _parse_atomic_charge_separation(
-        self, lines: list[str], atomic_props: dict, start_idx: int
+        self,
+        lines: list[str],
+        atomic_props: dict[int, dict[str, float]],
+        start_idx: int,
     ) -> dict[int, dict[str, float]]:
         """Parse atomic internal charge separation section from stdout."""
         for i in range(start_idx + 1, len(lines)):

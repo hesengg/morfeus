@@ -55,11 +55,20 @@ def build_execution_env(
         return env_variables
 
     env = dict(os.environ)
-    num_threads = n_processes if n_processes is not None else config.OMP_NUM_THREADS
+    config_num_threads = getattr(config, "OMP_NUM_THREADS", 1)
+    if not isinstance(config_num_threads, Integral):
+        config_num_threads = 1
+
+    config_stacksize = getattr(config, "OMP_STACKSIZE", "1G")
+    config_max_active_levels = getattr(config, "OMP_MAX_ACTIVE_LEVELS", 1)
+    if not isinstance(config_max_active_levels, Integral):
+        config_max_active_levels = 1
+
+    num_threads = n_processes if n_processes is not None else int(config_num_threads)
     env["OMP_NUM_THREADS"] = f"{num_threads},1"
     env["MKL_NUM_THREADS"] = f"{num_threads}"
-    env["OMP_STACKSIZE"] = config.OMP_STACKSIZE
-    env["OMP_MAX_ACTIVE_LEVELS"] = str(config.OMP_MAX_ACTIVE_LEVELS)
+    env["OMP_STACKSIZE"] = str(config_stacksize)
+    env["OMP_MAX_ACTIVE_LEVELS"] = str(int(config_max_active_levels))
     return env
 
 
