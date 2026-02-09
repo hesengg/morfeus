@@ -116,10 +116,10 @@ class TestMultiwfnCharges:
     """Test charge calculation methods."""
 
     @pytest.fixture
-    def mwfn(self):
+    def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        return Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_charges_adch(self, mwfn):
         """Test ADCH charge calculation."""
@@ -204,10 +204,10 @@ class TestMultiwfnSurface:
     """Test surface analysis methods."""
 
     @pytest.fixture
-    def mwfn(self):
+    def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        return Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_surface_esp(self, mwfn):
         """Test ESP surface calculation."""
@@ -310,9 +310,9 @@ class TestMultiwfnDensities:
     cube_file = DATA_DIR / "example_xtb_cub" / "spindensity.cub"
 
     @pytest.fixture
-    def mwfn_cube(self):
+    def mwfn_cube(self, tmp_path):
         """Create Multiwfn instance with cube file."""
-        return Multiwfn(self.cube_file, run_path=DATA_DIR / "test_output_cube")
+        return Multiwfn(self.cube_file, run_path=tmp_path / "test_output_cube")
 
     def test_get_densities(self, mwfn_cube):
         """Test density calculation from cube file."""
@@ -418,10 +418,10 @@ class TestMultiwfnParsing:
 class TestMultiwfnInitialization:
     """Test Multiwfn initialization."""
 
-    def test_init_valid_file(self):
+    def test_init_valid_file(self, tmp_path):
         """Test initialization with valid molden file."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        mwfn = Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
         assert mwfn._file_path == molden_file.resolve()
         assert mwfn._run_path.exists()
 
@@ -430,10 +430,10 @@ class TestMultiwfnInitialization:
         with pytest.raises(FileNotFoundError):
             Multiwfn("nonexistent_file.input")
 
-    def test_init_custom_output_dir(self):
+    def test_init_custom_output_dir(self, tmp_path):
         """Test initialization with custom output directory."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        run_path = DATA_DIR / "custom_output"
+        run_path = tmp_path / "custom_output"
         mwfn = Multiwfn(molden_file, run_path=run_path)
         assert mwfn._run_path == run_path.resolve()
 
@@ -443,10 +443,10 @@ class TestMultiwfnInitialization:
         with Multiwfn(molden_file) as mwfn:
             assert mwfn._file_path.exists()
 
-    def test_init_cube_does_not_detect_spin(self):
+    def test_init_cube_does_not_detect_spin(self, tmp_path):
         """Test that spin detection is not attempted for cube inputs."""
         cube_file = DATA_DIR / "example_xtb_cub" / "spindensity.cub"
-        mwfn = Multiwfn(cube_file, run_path=DATA_DIR / "test_output_cube")
+        mwfn = Multiwfn(cube_file, run_path=tmp_path / "test_output_cube")
         assert mwfn._has_spin is None
 
 
@@ -454,10 +454,10 @@ class TestMultiwfnInitialization:
 class TestMultiwfnResults:
     """Test results caching and access."""
 
-    def test_results_caching_multiple_models(self):
+    def test_results_caching_multiple_models(self, tmp_path):
         """Test that multiple charge models are cached separately."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        mwfn = Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
         charges_adch = mwfn.get_charges(model="adch")
         charges_hirsh = mwfn.get_charges(model="hirshfeld")
@@ -470,10 +470,10 @@ class TestMultiwfnResults:
         assert "adch" in mwfn._results.charges
         assert "hirshfeld" in mwfn._results.charges
 
-    def test_results_multiple_surfaces(self):
+    def test_results_multiple_surfaces(self, tmp_path):
         """Test that multiple surface models are cached separately."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        mwfn = Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
         surface_esp = mwfn.get_surface(model="esp")
         surface_alie = mwfn.get_surface(model="alie")
@@ -486,20 +486,20 @@ class TestMultiwfnResults:
         assert "esp" in mwfn._results.surfaces
         assert "alie" in mwfn._results.surfaces
 
-    def test_get_citations(self):
+    def test_get_citations(self, tmp_path):
         """Test citation collection helper."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        mwfn = Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
         citations = mwfn.get_citations()
         assert isinstance(citations, list)
         assert any(
             "J. Comput. Chem., 33, 580 (2012)" in citation for citation in citations
         )
 
-    def test_list_options(self):
+    def test_list_options(self, tmp_path):
         """Test listing supported analysis options."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        mwfn = Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
         options = mwfn.list_options()
         assert "charges" in options
         assert "surface" in options
@@ -516,10 +516,10 @@ class TestMultiwfnBatchBehavior:
     """Test batch API behavior on invalid entries."""
 
     @pytest.fixture
-    def mwfn(self):
+    def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        return Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_descriptors_raises_on_invalid(self, mwfn):
         """Test that get_descriptors raises on invalid descriptor."""
@@ -537,10 +537,10 @@ class TestMultiwfnBondOrders:
     """Test bond order calculation methods."""
 
     @pytest.fixture
-    def mwfn(self):
+    def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
-        return Multiwfn(molden_file, run_path=DATA_DIR / "test_output")
+        return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_bond_order_invalid_model(self, mwfn):
         """Test that invalid bond order model raises ValueError."""
@@ -581,11 +581,14 @@ class TestMultiwfnSettingsAndHelpers:
 
     def test_load_settingini_and_alias(self, molden_file, tmp_path):
         """Test loading settings.ini via both method names."""
-        settings_file = DATA_DIR / "test_output" / "ESP" / "settings.ini"
-        mwfn = Multiwfn(molden_file, run_path=tmp_path, has_spin=False)
+        settings_file = tmp_path / "source" / "settings.ini"
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        settings_file.write_text("set nthreads=1\n")
+
+        mwfn = Multiwfn(molden_file, run_path=tmp_path / "run", has_spin=False)
         mwfn.load_settingini(settings_file)
         assert mwfn._settings_ini_path == settings_file.resolve()
-        assert (tmp_path / "settings.ini").exists()
+        assert (tmp_path / "run" / "settings.ini").exists()
 
         alias_path = tmp_path / "alias"
         mwfn_alias = Multiwfn(molden_file, run_path=alias_path, has_spin=False)

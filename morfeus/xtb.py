@@ -879,7 +879,8 @@ class XTB:
         elif runtype == "spin density":
             inputs["write"] = inputs.get("write", []) + ["spin density=true"]
 
-        write_xtb_inp(xtb_inp, inputs)
+        if len(inputs) > 0:
+            write_xtb_inp(xtb_inp, inputs)
         return inputs != {}
 
     @requires_executable(["xtb"])
@@ -911,6 +912,8 @@ class XTB:
                 "and HOMO/LUMO energies.\n"
                 "For other descriptors, choose another xtb method."
             )
+        elif runtype == "sp":
+            pass
         elif runtype == "ipea":
             arguments_xtb_command = " --vipea"
         elif runtype == "fukui":
