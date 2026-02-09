@@ -867,8 +867,8 @@ class XTB:
         self._run_xtb("spin density")
         return self._run_path / XTB._xtb_spin_density_cube_file
 
-    def _make_xtb_inp(self, run_folder: Path, runtype: str) -> None:
-        """Create xTB input file for solvation calculations."""
+    def _make_xtb_inp(self, run_folder: Path, runtype: str) -> bool:
+        """Create an xTB input file and return whether it should be used."""
         xtb_inp = run_folder / XTB._xtb_input_file
         inputs = {}
         if self._solvent is not None:
@@ -879,10 +879,8 @@ class XTB:
         elif runtype == "spin density":
             inputs["write"] = inputs.get("write", []) + ["spin density=true"]
 
-        if inputs != {}:
-            self._default_xtb_command += f" --input {XTB._xtb_input_file}"
-
         write_xtb_inp(xtb_inp, inputs)
+        return inputs != {}
 
     @requires_executable(["xtb"])
     def _run_xtb(self, runtype: str) -> None:  # noqa: C901
@@ -907,10 +905,7 @@ class XTB:
         arguments_xtb_command = ""
 
         runtypes = ["sp", "ipea", "fukui", "fod", "molden", "density", "spin density"]
-        if runtype == "sp":
-            if self._solvent is not None:
-                self._default_xtb_command += f" --input {XTB._xtb_input_file}"
-        elif self._method == "ptb":
+        if runtype != "sp" and self._method == "ptb":
             raise ValueError(
                 "PTB can only be used for calculations of bond orders, charges, dipole, "
                 "and HOMO/LUMO energies.\n"
@@ -955,9 +950,11 @@ class XTB:
             xyz_file = run_folder / XTB._xyz_input_file
             write_xyz(xyz_file, self._elements, self._coordinates)
 
-            self._make_xtb_inp(run_folder, runtype)
+            use_xtb_input = self._make_xtb_inp(run_folder, runtype)
 
             command = self._default_xtb_command + arguments_xtb_command
+            if use_xtb_input:
+                command += f" --input {XTB._xtb_input_file}"
             # Run xtb
             with open(run_folder / "xtb.out", "w") as stdout, open(
                 run_folder / "xtb.err", "w"

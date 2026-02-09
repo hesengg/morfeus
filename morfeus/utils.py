@@ -45,14 +45,17 @@ def build_execution_env(
     """Build environment variables for external executables.
 
     Args:
-        env_variables: Explicit environment override. If provided, returned as-is.
+        env_variables: Explicit environment overrides. If provided, applied on top of
+            the current process environment.
         n_processes: Number of threads to use for OMP/MKL settings.
 
     Returns:
         Environment variables for a subprocess.
     """
     if env_variables is not None:
-        return env_variables
+        env = dict(os.environ)
+        env.update(env_variables)
+        return env
 
     env = dict(os.environ)
     config_num_threads = getattr(config, "OMP_NUM_THREADS", 1)
