@@ -13,12 +13,14 @@ import shutil
 import tempfile
 import time
 from types import TracebackType
-from typing import Any, cast, Iterable, TYPE_CHECKING
+import typing
+from typing import Any, cast, Iterable
 
-if TYPE_CHECKING:
+if typing.TYPE_CHECKING:
     import pexpect
 
-from morfeus.utils import build_execution_env, requires_executable
+from morfeus.utils import build_execution_env, requires_executable, Import, requires_dependency
+
 
 RealFunctionSetting = int | tuple[int, str]
 VectorFunctionSetting = tuple[int, int, int] | tuple[tuple[int, int, int], str]
@@ -308,7 +310,7 @@ class MultiwfnResults:
     ) = None
     citations: set[str] = field(default_factory=set)
 
-
+@requires_dependency([Import("pexpect")], globals())
 class _PexpectSession:
     """Pexpect session manager for Multiwfn."""
 

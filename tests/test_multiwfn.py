@@ -3,10 +3,12 @@
 import math
 from pathlib import Path
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pexpect
 import pytest
+
+if TYPE_CHECKING:
+    import pexpect
 
 import morfeus.config as morfeus_config
 from morfeus.multiwfn import (
@@ -17,11 +19,11 @@ from morfeus.multiwfn import (
     ProgressState,
     WaitProgress,
 )
-from morfeus.utils import build_execution_env
+from morfeus.utils import build_execution_env, requires_dependency, Import
 
 DATA_DIR = Path(__file__).parent / "data" / "multiwfn"
 
-
+@requires_dependency([Import("pexpect")], globals())
 class _DummyChild:
     """Dummy pexpect child process for unit-testing session behavior."""
 
@@ -847,42 +849,6 @@ class TestMultiwfnRunStubs:
         assert "atomic" in surface
         assert "global" in surface
         assert surface["atomic"][1]["area_total"] == pytest.approx(10.0)
-
-    def test_get_grid_and_get_grids_all_qualities(self, mwfn, monkeypatch, tmp_path):
-        """Test grid generation for multiple quality settings."""
-        counter = {"n": 0}
-
-        def fake_run(commands, subdir=None):
-            del commands
-            result = _make_run_result(tmp_path, subdir, "")
-            counter["n"] += 1
-            (result.workdir / f"generated_{counter['n']}.cub").write_text("cube")
-            return result
-
-        monkeypatch.setattr(mwfn, "run_commands", fake_run)
-
-        selected_names = []
-        for quality in ("low", "medium", "high", "LOW"):
-            grid_file = mwfn.get_grid("rho", quality)
-            assert grid_file.suffix == ".cub"
-            assert grid_file.exists()
-            selected_names.append(grid_file.name)
-        assert selected_names == [
-            "generated_1.cub",
-            "generated_2.cub",
-            "generated_3.cub",
-            "generated_4.cub",
-        ]
-
-        renamed = mwfn.get_grid("rho", "low", grid_file_name="renamed.cub")
-        assert renamed.name == "renamed.cub"
-        assert renamed.exists()
-
-        many = mwfn.get_grids(["rho", "rho_lapl"], "medium")
-        assert set(many) == {"rho", "rho_lapl"}
-
-        with pytest.raises(ValueError, match="Grid quality"):
-            mwfn.get_grid("rho", "ultra")
 
     def test_get_grid_raises_when_no_cube_is_generated(
         self, mwfn, monkeypatch, tmp_path

@@ -18,7 +18,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     package_data={"morfeus": ["py.typed"]},
     python_requires=">=3.10",
-    install_requires=["fire", "numpy", "packaging", "scipy", "pexpect"],
+    install_requires=["fire", "numpy", "packaging", "scipy"],
     license="MIT",
     classifiers=[
         "Programming Language :: Python :: 3",
