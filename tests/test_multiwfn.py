@@ -3,7 +3,7 @@
 import math
 from pathlib import Path
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 import pytest
 
@@ -19,9 +19,10 @@ from morfeus.multiwfn import (
     ProgressState,
     WaitProgress,
 )
-from morfeus.utils import build_execution_env, requires_dependency, Import
+from morfeus.utils import build_execution_env, Import, requires_dependency
 
 DATA_DIR = Path(__file__).parent / "data" / "multiwfn"
+
 
 @requires_dependency([Import("pexpect")], globals())
 class _DummyChild:

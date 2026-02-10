@@ -19,8 +19,12 @@ from typing import Any, cast, Iterable
 if typing.TYPE_CHECKING:
     import pexpect
 
-from morfeus.utils import build_execution_env, requires_executable, Import, requires_dependency
-
+from morfeus.utils import (
+    build_execution_env,
+    Import,
+    requires_dependency,
+    requires_executable,
+)
 
 RealFunctionSetting = int | tuple[int, str]
 VectorFunctionSetting = tuple[int, int, int] | tuple[tuple[int, int, int], str]
@@ -309,6 +313,7 @@ class MultiwfnResults:
         dict[str, dict[int, tuple[float, float, float]]] | None
     ) = None
     citations: set[str] = field(default_factory=set)
+
 
 @requires_dependency([Import("pexpect")], globals())
 class _PexpectSession:
