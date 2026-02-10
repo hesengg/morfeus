@@ -925,7 +925,7 @@ class XTB:
         elif runtype == "density":
             pass
         elif runtype == "spin density":
-            if self._n_unpaired == 0:
+            if self._n_unpaired is not None and self._n_unpaired == 0:
                 raise ValueError(
                     "Spin density calculation requires unpaired electrons."
                 )

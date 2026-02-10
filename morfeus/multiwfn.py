@@ -13,9 +13,10 @@ import shutil
 import tempfile
 import time
 from types import TracebackType
-from typing import Any, cast, Iterable
+from typing import Any, cast, Iterable, TYPE_CHECKING
 
-import pexpect
+if TYPE_CHECKING:
+    import pexpect
 
 from morfeus.utils import build_execution_env, requires_executable
 
@@ -408,8 +409,11 @@ class _PexpectSession:
         except pexpect.TIMEOUT:
             self.read_available()
             recent_output = self.get_output_since_last_command()
-            print(f"[WARN] Timeout ({self._expect_timeout}s) waiting for: {pattern!r}")
-            print(f"Recent output: {recent_output[-500:]}")
+            if self._debug:
+                print(
+                    f"[WARN] Timeout ({self._expect_timeout}s) waiting for: {pattern!r}"
+                )
+                print(f"Recent output: {recent_output[-500:]}")
             return False
 
     def try_expect(self, pattern: str, timeout: float = 1.0) -> bool:
@@ -474,7 +478,13 @@ class _PexpectSession:
     def _execute_command(self, cmd: str, expect: str | None, use_robust: bool) -> None:
         """Execute command with optional expect."""
         if use_robust and expect:
-            self.expect(expect)
+            pattern = expect
+            matched = self.expect(pattern)
+            if not matched:
+                raise RuntimeError(
+                    f"Expected pattern not found before command {cmd!r}: {pattern!r}"
+                    f"Expected pattern not found before command {cmd!r}: {pattern!r}"
+                )
         self.send(cmd)
         if not use_robust:
             self.read_available()
