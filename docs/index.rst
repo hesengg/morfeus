@@ -68,6 +68,7 @@ Features
 * Exact ligand cone angle
 * Ligand solid angle
 * Local force constant
+* Multiwfn interface
 * Pyramidalization
 * Solvent accessible surface area
 * Sterimol parameters
@@ -116,6 +117,7 @@ both academic and commercial use.
    conformer
    dispersion
    local_force
+   multiwfn
    pyramidalization
    sasa
    solid_angle

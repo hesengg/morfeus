@@ -7,17 +7,16 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import functools
 import json
-import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 
 import numpy as np
 
-from morfeus import config
 from morfeus.data import (
     AU_TO_DEBYE,
     DEBYE_TO_AU,
@@ -28,7 +27,7 @@ from morfeus.data import (
 )
 from morfeus.io import read_geometry, write_xtb_inp, write_xyz
 from morfeus.typing import Array1DFloat, Array2DFloat, ArrayLike2D
-from morfeus.utils import convert_elements, requires_executable
+from morfeus.utils import build_execution_env, convert_elements, requires_executable
 
 
 class XTB:
@@ -61,9 +60,13 @@ class XTB:
     _method: int | str
     _n_processes: int | None
     _env_variables: dict[str, str] | None
+    _iterations: int | None = None
 
     _xyz_input_file: str = "xtb.xyz"
     _xtb_input_file: str = "xtb.inp"
+    _xtb_molden_file: str = "xtb.molden"
+    _xtb_density_cube_file: str = "density.cub"
+    _xtb_spin_density_cube_file: str = "spindensity.cub"
 
     def __init__(
         self,
@@ -91,7 +94,11 @@ class XTB:
         self._n_processes = n_processes
         self._env_variables = env_variables
 
-        self._run_path = Path(run_path) if run_path else None
+        self._run_path = (
+            Path(run_path)
+            if run_path
+            else Path(tempfile.mkdtemp(prefix="morfeus_xtb_"))
+        )
 
         self._default_xtb_command = (
             f"xtb {XTB._xyz_input_file} --json --chrg {self._charge}"
@@ -115,6 +122,8 @@ class XTB:
             self._default_xtb_command += f" --uhf {self._n_unpaired}"
         if self._electronic_temperature is not None:
             self._default_xtb_command += f" --etemp {self._electronic_temperature}"
+        if self._iterations is not None:
+            self._default_xtb_command += f" --iterations {self._iterations}"
 
         self._results = XTBResults()
         self._corrected: bool | None = None
@@ -843,6 +852,37 @@ class XTB:
 
         return h_bond_corrections
 
+    def get_molden(self) -> Path:
+        """Generate molden file for the molecule."""
+        self._run_xtb("molden")
+        return self._run_path / XTB._xtb_molden_file
+
+    def get_density(self) -> Path:
+        """Generate electron density cube file for the molecule."""
+        self._run_xtb("density")
+        return self._run_path / XTB._xtb_density_cube_file
+
+    def get_spin_density(self) -> Path:
+        """Generate spin density cube file for the molecule."""
+        self._run_xtb("spin density")
+        return self._run_path / XTB._xtb_spin_density_cube_file
+
+    def _make_xtb_inp(self, run_folder: Path, runtype: str) -> bool:
+        """Create an xTB input file and return whether it should be used."""
+        xtb_inp = run_folder / XTB._xtb_input_file
+        inputs = {}
+        if self._solvent is not None:
+            inputs["write"] = ["gbsa=true"]
+
+        if runtype == "density":
+            inputs["write"] = inputs.get("write", []) + ["density=true"]
+        elif runtype == "spin density":
+            inputs["write"] = inputs.get("write", []) + ["spin density=true"]
+
+        if len(inputs) > 0:
+            write_xtb_inp(xtb_inp, inputs)
+        return inputs != {}
+
     @requires_executable(["xtb"])
     def _run_xtb(self, runtype: str) -> None:  # noqa: C901
         """Run xTB calculation and parse results.
@@ -853,6 +893,9 @@ class XTB:
                 - 'ipea': Ionization potential and electron affinity calculation
                 - 'fukui': Fukui coefficient calculation
                 - 'fod': Fractional occupation density calculation
+                - 'molden': Generate molden file
+                - 'density': Electron density calculation
+                - 'spin density': Spin density calculation
 
         Raises:
             ValueError: If runtype does not exist
@@ -860,23 +903,32 @@ class XTB:
             RuntimeError: If the xtb calculation failed
         """
         # Set xtb command
-        runtypes = ["sp", "ipea", "fukui", "fod"]
-        if runtype == "sp":
-            command = self._default_xtb_command
-            if self._solvent is not None:
-                command += f" --input {XTB._xtb_input_file}"
-        elif self._method == "ptb":
+        arguments_xtb_command = ""
+
+        runtypes = ["sp", "ipea", "fukui", "fod", "molden", "density", "spin density"]
+        if runtype != "sp" and self._method == "ptb":
             raise ValueError(
                 "PTB can only be used for calculations of bond orders, charges, dipole, "
                 "and HOMO/LUMO energies.\n"
                 "For other descriptors, choose another xtb method."
             )
+        elif runtype == "sp":
+            pass
         elif runtype == "ipea":
-            command = self._default_xtb_command + " --vipea"
+            arguments_xtb_command = " --vipea"
         elif runtype == "fukui":
-            command = self._default_xtb_command + " --vfukui"
+            arguments_xtb_command = " --vfukui"
         elif runtype == "fod":
-            command = self._default_xtb_command + " --fod"
+            arguments_xtb_command = " --fod"
+        elif runtype == "molden":
+            arguments_xtb_command = " --molden"
+        elif runtype == "density":
+            pass
+        elif runtype == "spin density":
+            if self._n_unpaired is not None and self._n_unpaired == 0:
+                raise ValueError(
+                    "Spin density calculation requires unpaired electrons."
+                )
         else:
             raise ValueError(
                 f"Runtype {runtype!r} does not exist. Choose one of {', '.join(runtypes)}."
@@ -901,11 +953,11 @@ class XTB:
             xyz_file = run_folder / XTB._xyz_input_file
             write_xyz(xyz_file, self._elements, self._coordinates)
 
-            # To
-            if self._solvent is not None:
-                xtb_inp = run_folder / XTB._xtb_input_file
-                write_xtb_inp(xtb_inp, {"write": ["gbsa=true"]})
+            use_xtb_input = self._make_xtb_inp(run_folder, runtype)
 
+            command = self._default_xtb_command + arguments_xtb_command
+            if use_xtb_input:
+                command += f" --input {XTB._xtb_input_file}"
             # Run xtb
             with open(run_folder / "xtb.out", "w") as stdout, open(
                 run_folder / "xtb.err", "w"
@@ -920,8 +972,13 @@ class XTB:
                 )
 
             # Return error if xtb fails
-            with open(run_folder / "xtb.err", "r", encoding="utf8") as f:
-                err_content = f.read()
+            err_file = run_folder / "xtb.err"
+            if err_file.exists():
+                with open(err_file, "r", encoding="utf8") as f:
+                    err_content = f.read()
+            else:
+                err_content = ""
+
             if not re.search(r"(?<!ab)normal termination of xtb", err_content):
                 with open(run_folder / "xtb.out", "r", encoding="utf8") as f:
                     out_content = f.read()
@@ -929,7 +986,11 @@ class XTB:
                     error = (
                         out_content[start_error_idx:]
                         if start_error_idx != -1
-                        else err_content
+                        else (
+                            err_content
+                            if err_content
+                            else "xtb process failed with no error output"
+                        )
                     )
                 raise RuntimeError(f"xtb calculation failed. Error:\n{error}")
 
@@ -944,24 +1005,28 @@ class XTB:
                 self._parse_out_fukui(run_folder / "xtb.out")
             elif runtype == "fod":
                 self._parse_fod(run_folder / "fod")
+            elif runtype == "molden":
+                shutil.copy(
+                    run_folder / "molden.input",
+                    self._run_path / XTB._xtb_molden_file,
+                )
+            elif runtype == "density":
+                shutil.copy(
+                    run_folder / XTB._xtb_density_cube_file,
+                    self._run_path / XTB._xtb_density_cube_file,
+                )
+            elif runtype == "spin density":
+                shutil.copy(
+                    run_folder / XTB._xtb_spin_density_cube_file,
+                    self._run_path / XTB._xtb_spin_density_cube_file,
+                )
 
     def _set_env(self) -> dict[str, str]:
         """Set environment variables for xTB execution."""
-        if self._env_variables is not None:
-            env = self._env_variables
-        else:
-            env = dict(os.environ)
-            num_threads = (
-                self._n_processes
-                if self._n_processes is not None
-                else config.OMP_NUM_THREADS
-            )
-            env["OMP_NUM_THREADS"] = f"{num_threads},1"
-            env["MKL_NUM_THREADS"] = f"{num_threads}"
-            env["OMP_STACKSIZE"] = config.OMP_STACKSIZE
-            env["OMP_MAX_ACTIVE_LEVELS"] = str(config.OMP_MAX_ACTIVE_LEVELS)
-
-        return env
+        return build_execution_env(
+            env_variables=self._env_variables,
+            n_processes=self._n_processes,
+        )
 
     def _parse_json(self, json_file: Path | str) -> None:
         """Parse 'xtbout.json' file."""
