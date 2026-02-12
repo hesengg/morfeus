@@ -3,7 +3,7 @@
 import math
 from pathlib import Path
 import time
-from typing import Any, TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 
 import pytest
 
@@ -22,6 +22,59 @@ from morfeus.multiwfn import (
 from morfeus.utils import build_execution_env, Import, requires_dependency
 
 DATA_DIR = Path(__file__).parent / "data" / "multiwfn"
+EXAMPLE_MOLDEN_DIR = DATA_DIR / "example_molden"
+EXAMPLE_WFN_DIR = DATA_DIR / "example_wfn"
+DEFAULT_MOLDEN_FILE = EXAMPLE_MOLDEN_DIR / "xtb_singlet.molden"
+DEFAULT_WFN_FILE = EXAMPLE_WFN_DIR / "pyscf_casscf_triplet_rohf_natorb.wfn"
+FAST_DESCRIPTOR_SMOKE_MODELS = ("ESP_nuclear", "deltag_pro", "RDG_pro")
+CHARGE_SMOKE_MODELS = ("adch", "hirshfeld")
+BOND_ORDER_SMOKE_MODELS = ("mayer", "wiberg")
+SURFACE_SMOKE_MODEL = "ALIE"
+WFN_NO_BASIS_FUNCTION_INFORMATION_ERROR = (
+    "The input file you used does not contain basis function information!"
+)
+
+
+def _infer_has_spin_from_name(file_path: Path) -> bool:
+    """Infer open-shell state from fixture filename."""
+    name = file_path.stem.lower()
+    if "triplet" in name:
+        return True
+    if "singlet" in name:
+        return False
+    raise ValueError(
+        f"Could not infer spin state from file name {file_path.name!r}; "
+        "expected 'singlet' or 'triplet'."
+    )
+
+
+def _infer_unrestricted_from_name(file_path: Path) -> bool:
+    """Infer unrestricted wavefunction flag from fixture filename."""
+    name = file_path.stem.lower()
+    return any(marker in name for marker in ("uks", "uhf", "unrestricted"))
+
+
+def _collect_wavefunction_cases() -> list[tuple[Path, bool, bool]]:
+    """Collect Molden/WFN fixtures and infer shell/wavefunction metadata."""
+    wavefunction_files = sorted(
+        path
+        for path in EXAMPLE_MOLDEN_DIR.iterdir()
+        if path.suffix.lower() == ".molden"
+    )
+    return [
+        (
+            file_path,
+            _infer_has_spin_from_name(file_path),
+            _infer_unrestricted_from_name(file_path),
+        )
+        for file_path in wavefunction_files
+    ]
+
+
+EXAMPLE_WAVEFUNCTION_CASES = _collect_wavefunction_cases()
+EXAMPLE_WAVEFUNCTION_CASE_IDS = [
+    file_path.name for file_path, _, _ in EXAMPLE_WAVEFUNCTION_CASES
+]
 
 
 @requires_dependency([Import("pexpect")], globals())
@@ -92,7 +145,7 @@ def _make_run_result(
 @pytest.fixture
 def molden_file() -> Path:
     """Path to molden file used by tests."""
-    return DATA_DIR / "example_xtb" / "molden.input"
+    return DEFAULT_MOLDEN_FILE
 
 
 @pytest.fixture
@@ -115,13 +168,168 @@ def fake_session() -> _PexpectSession:
 
 
 @pytest.mark.multiwfn
+class TestMultiwfnExampleFileMatrix:
+    """Run a compact descriptor-method matrix for every Molden/WFN fixture."""
+
+    @pytest.fixture(
+        params=EXAMPLE_WAVEFUNCTION_CASES,
+        ids=EXAMPLE_WAVEFUNCTION_CASE_IDS,
+    )
+    def wavefunction_case(self, request) -> tuple[Path, bool, bool]:
+        """Yield (file_path, has_spin, is_unrestricted) for each fixture."""
+        return cast(tuple[Path, bool, bool], request.param)
+
+    @pytest.fixture
+    def mwfn_case(self, wavefunction_case, tmp_path) -> Multiwfn:
+        """Create a Multiwfn instance for one fixture with inferred spin state."""
+        file_path, has_spin, _ = wavefunction_case
+        return Multiwfn(
+            file_path,
+            run_path=tmp_path / file_path.stem,
+            has_spin=has_spin,
+        )
+
+    def test_method_matrix_for_each_wavefunction_file(self, mwfn_case) -> None:
+        """Smoke-test key analyses on each fixture file."""
+        for model in CHARGE_SMOKE_MODELS:
+            charges = mwfn_case.get_charges(model=model)
+            assert isinstance(charges, dict)
+            assert len(charges) > 0
+
+        for model in BOND_ORDER_SMOKE_MODELS:
+            bond_orders = mwfn_case.get_bond_order(model=model)
+            assert isinstance(bond_orders, dict)
+            assert len(bond_orders) > 0
+
+        moments = mwfn_case.get_electric_moments()
+        assert isinstance(moments, dict)
+        assert len(moments) > 0
+
+        gap = mwfn_case.get_gaps(n=1)
+        assert "orbitals" in gap
+        assert "gaps" in gap
+        assert len(gap["orbitals"]) > 0
+        assert "homo_index" in gap["gaps"]
+
+        localization = mwfn_case.get_localization()
+        assert isinstance(localization, dict)
+        assert len(localization) > 0
+
+        surface = mwfn_case.get_surface(model=SURFACE_SMOKE_MODEL)
+        assert "atomic" in surface
+        assert "global" in surface
+        assert len(surface["atomic"]) > 0
+
+        for descriptor in FAST_DESCRIPTOR_SMOKE_MODELS:
+            atomic_values = mwfn_case.get_descriptor(descriptor)
+            assert isinstance(atomic_values, dict)
+            assert len(atomic_values) > 0
+
+            grid_file = mwfn_case.get_grid(
+                descriptor,
+                grid_quality="low",
+                grid_file_name=f"{descriptor}.cub",
+            )
+            assert grid_file.exists()
+            assert grid_file.suffix == ".cub"
+
+            grid_descriptors = mwfn_case.grid_to_descriptors(grid_file)
+            assert isinstance(grid_descriptors, dict)
+            assert len(grid_descriptors) > 0
+
+    def test_spin_and_wavefunction_restricted_methods(
+        self, mwfn_case, wavefunction_case
+    ) -> None:
+        """Validate spin-gated descriptor and conceptual-DFT behavior."""
+        _, has_spin, is_unrestricted = wavefunction_case
+
+        if has_spin:
+            with pytest.raises(ValueError, match="open-shell systems"):
+                mwfn_case.get_descriptor("dft_xc_closed")
+
+            with pytest.raises(ValueError, match="closed-shell"):
+                mwfn_case.get_fukui()
+            with pytest.raises(ValueError, match="closed-shell"):
+                mwfn_case.get_superdelocalizabilities()
+
+            if is_unrestricted:
+                with pytest.raises(ValueError, match="closed-shell"):
+                    mwfn_case.get_fukui()
+                with pytest.raises(ValueError, match="closed-shell"):
+                    mwfn_case.get_superdelocalizabilities()
+            return
+
+        with pytest.raises(ValueError, match="closed-shell systems"):
+            mwfn_case.get_descriptor("alpha_density")
+
+        try:
+            fukui = mwfn_case.get_fukui()
+        except RuntimeError as exc:
+            assert "single-determinant wavefunction" in str(exc)
+        else:
+            assert "f_plus" in fukui
+            assert len(fukui["f_plus"]) > 0
+
+        try:
+            superdeloc = mwfn_case.get_superdelocalizabilities()
+        except RuntimeError as exc:
+            assert "single-determinant wavefunction" in str(exc)
+        else:
+            assert "d_n" in superdeloc
+            assert len(superdeloc["d_n"]) > 0
+
+
+@pytest.mark.multiwfn
+class TestMultiwfnWfnRestrictions:
+    """Validate model restrictions when using .wfn wavefunction files."""
+
+    @pytest.fixture
+    def mwfn_wfn(self, tmp_path) -> Multiwfn:
+        """Create a Multiwfn instance backed by a .wfn input file."""
+        return Multiwfn(
+            DEFAULT_WFN_FILE,
+            run_path=tmp_path / "wfn",
+            has_spin=True,
+        )
+
+    @pytest.mark.parametrize("model", ["mayer", "wiberg", "mulliken"])
+    def test_get_bond_order_missing_basis_information_raises(
+        self, mwfn_wfn, model, monkeypatch
+    ) -> None:
+        """Bond-order methods requiring basis functions must fail for .wfn input."""
+
+        def fail_if_run_commands(*args, **kwargs):
+            del args, kwargs
+            pytest.fail("run_commands should not be called for unsupported .wfn model")
+
+        monkeypatch.setattr(mwfn_wfn, "run_commands", fail_if_run_commands)
+        with pytest.raises(ValueError) as excinfo:
+            mwfn_wfn.get_bond_order(model=model)
+        assert str(excinfo.value) == WFN_NO_BASIS_FUNCTION_INFORMATION_ERROR
+
+    def test_get_mulliken_charge_missing_basis_information_raises(
+        self, mwfn_wfn, monkeypatch
+    ) -> None:
+        """Mulliken charges must fail for .wfn input."""
+
+        def fail_if_run_commands(*args, **kwargs):
+            del args, kwargs
+            pytest.fail("run_commands should not be called for unsupported .wfn model")
+
+        monkeypatch.setattr(mwfn_wfn, "run_commands", fail_if_run_commands)
+        with pytest.raises(ValueError) as excinfo:
+            mwfn_wfn.get_charges(model="mulliken")
+        assert str(excinfo.value) == WFN_NO_BASIS_FUNCTION_INFORMATION_ERROR
+
+
+@pytest.mark.multiwfn
 class TestMultiwfnCharges:
     """Test charge calculation methods."""
 
     @pytest.fixture
     def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_charges_adch(self, mwfn):
@@ -209,7 +417,7 @@ class TestMultiwfnSurface:
     @pytest.fixture
     def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_surface_esp(self, mwfn):
@@ -329,7 +537,7 @@ class TestMultiwfnDensities:
 
     def test_get_densities_wrong_file_type(self):
         """Test that non-cube file raises ValueError."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file)
         with pytest.raises(ValueError, match="requires a .cub or .grd file"):
             mwfn.grid_to_descriptors(molden_file)
@@ -347,7 +555,7 @@ class TestMultiwfnParsing:
 
     def test_parse_bond_orders(self):
         """Test parsing bond order matrix from stdout."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file)
         stdout = "\n".join(
             [
@@ -361,7 +569,7 @@ class TestMultiwfnParsing:
 
     def test_parse_bond_orders_fallback(self):
         """Test parsing bond orders via fallback format."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file)
         stdout = "\n".join(
             [
@@ -393,7 +601,7 @@ class TestMultiwfnParsing:
             temp_path = Path(f.name)
 
         try:
-            molden_file = DATA_DIR / "example_xtb" / "molden.input"
+            molden_file = DEFAULT_MOLDEN_FILE
             mwfn = Multiwfn(molden_file)
             result = mwfn.parse_surfanalysis(temp_path)
 
@@ -410,7 +618,7 @@ class TestMultiwfnParsing:
 
     def test_parse_surfanalysis_nonexistent(self):
         """Test parsing of nonexistent file returns empty dict."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file)
         result = mwfn.parse_surfanalysis(Path("nonexistent.txt"))
         assert result["statistics"] == {}
@@ -423,7 +631,7 @@ class TestMultiwfnInitialization:
 
     def test_init_valid_file(self, tmp_path):
         """Test initialization with valid molden file."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
         assert mwfn._file_path == molden_file.resolve()
         assert mwfn._run_path.exists()
@@ -435,14 +643,14 @@ class TestMultiwfnInitialization:
 
     def test_init_custom_output_dir(self, tmp_path):
         """Test initialization with custom output directory."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         run_path = tmp_path / "custom_output"
         mwfn = Multiwfn(molden_file, run_path=run_path)
         assert mwfn._run_path == run_path.resolve()
 
     def test_context_manager(self):
         """Test context manager support."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         with Multiwfn(molden_file) as mwfn:
             assert mwfn._file_path.exists()
 
@@ -459,7 +667,7 @@ class TestMultiwfnResults:
 
     def test_results_caching_multiple_models(self, tmp_path):
         """Test that multiple charge models are cached separately."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
         charges_adch = mwfn.get_charges(model="adch")
@@ -475,7 +683,7 @@ class TestMultiwfnResults:
 
     def test_results_multiple_surfaces(self, tmp_path):
         """Test that multiple surface models are cached separately."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
         surface_esp = mwfn.get_surface(model="esp")
@@ -491,7 +699,7 @@ class TestMultiwfnResults:
 
     def test_get_citations(self, tmp_path):
         """Test citation collection helper."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
         citations = mwfn.get_citations()
         assert isinstance(citations, list)
@@ -501,7 +709,7 @@ class TestMultiwfnResults:
 
     def test_list_options(self, tmp_path):
         """Test listing supported analysis options."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         mwfn = Multiwfn(molden_file, run_path=tmp_path / "test_output")
         options = mwfn.list_options()
         assert "charges" in options
@@ -521,7 +729,7 @@ class TestMultiwfnBatchBehavior:
     @pytest.fixture
     def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_descriptor_raises_on_invalid(self, mwfn):
@@ -542,7 +750,7 @@ class TestMultiwfnBondOrders:
     @pytest.fixture
     def mwfn(self, tmp_path):
         """Create Multiwfn instance with molden file."""
-        molden_file = DATA_DIR / "example_xtb" / "molden.input"
+        molden_file = DEFAULT_MOLDEN_FILE
         return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
     def test_get_bond_order_invalid_model(self, mwfn):

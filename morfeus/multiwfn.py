@@ -254,6 +254,12 @@ BOND_ORDER_MODELS: dict[str, str] = {
     "laplacian": "8 Laplacian bond order",
 }
 
+MISSING_BASIS_FUNCTION_INFORMATION_ERROR = (
+    "The input file you used does not contain basis function information!"
+)
+WFN_UNSUPPORTED_CHARGE_MODELS: set[str] = {"mulliken"}
+WFN_UNSUPPORTED_BOND_ORDER_MODELS: set[str] = {"mayer", "wiberg", "mulliken"}
+
 GRID_QUALITIES: dict[str, str] = {
     "low": "1 Low quality grid",
     "medium": "2 Medium quality grid",
@@ -859,6 +865,10 @@ class Multiwfn:
         """Normalize option keys to lower-case."""
         return value.strip().lower()
 
+    def _is_wfn_input(self) -> bool:
+        """Return True when the current input file is a .wfn file."""
+        return self._file_path.suffix.lower() == ".wfn"
+
     def list_options(self) -> dict[str, list[str]]:
         """List available option names for common Multiwfn analyses."""
         return {
@@ -936,6 +946,8 @@ class Multiwfn:
             raise ValueError(
                 f"Charge model {model!r} not supported. Choose between {choices}."
             )
+        if self._is_wfn_input() and normalized_model in WFN_UNSUPPORTED_CHARGE_MODELS:
+            raise ValueError(MISSING_BASIS_FUNCTION_INFORMATION_ERROR)
 
         menu_pattern = CHARGE_MODELS[normalized_model]
         menu_cmd = menu_pattern.split(" ")[0]
@@ -1073,6 +1085,11 @@ class Multiwfn:
             raise ValueError(
                 "Bond order type " f"{model!r} not supported. Choose between {choices}."
             )
+        if (
+            self._is_wfn_input()
+            and normalized_model in WFN_UNSUPPORTED_BOND_ORDER_MODELS
+        ):
+            raise ValueError(MISSING_BASIS_FUNCTION_INFORMATION_ERROR)
 
         menu_pattern = BOND_ORDER_MODELS[normalized_model]
         menu_cmd = menu_pattern.split(" ")[0]
