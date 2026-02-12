@@ -516,7 +516,7 @@ class TestMultiwfnResults:
 
 @pytest.mark.multiwfn
 class TestMultiwfnBatchBehavior:
-    """Test batch API behavior on invalid entries."""
+    """Test descriptor/grid API behavior on invalid entries."""
 
     @pytest.fixture
     def mwfn(self, tmp_path):
@@ -524,15 +524,15 @@ class TestMultiwfnBatchBehavior:
         molden_file = DATA_DIR / "example_xtb" / "molden.input"
         return Multiwfn(molden_file, run_path=tmp_path / "test_output")
 
-    def test_get_descriptors_raises_on_invalid(self, mwfn):
-        """Test that get_descriptors raises on invalid descriptor."""
+    def test_get_descriptor_raises_on_invalid(self, mwfn):
+        """Test that get_descriptor raises on invalid descriptor."""
         with pytest.raises(ValueError, match="not supported"):
-            mwfn.get_descriptors(["invalid_descriptor"])
+            mwfn.get_descriptor("invalid_descriptor")
 
-    def test_get_grids_raises_on_invalid(self, mwfn):
-        """Test that get_grids raises on invalid descriptor."""
+    def test_get_grid_raises_on_invalid_descriptor(self, mwfn):
+        """Test that get_grid raises on invalid descriptor."""
         with pytest.raises(ValueError, match="not supported"):
-            mwfn.get_grids(["invalid_descriptor"], grid_quality="low")
+            mwfn.get_grid("invalid_descriptor", grid_quality="low")
 
 
 @pytest.mark.multiwfn
@@ -737,10 +737,10 @@ class TestMultiwfnDescriptorBranches:
         with pytest.raises(ValueError, match="vector-valued"):
             mwfn._get_descriptor_function("coordinates")
 
-    def test_get_descriptor_and_get_descriptors(
+    def test_get_descriptor_caching_and_multiple_requests(
         self, molden_file, tmp_path, monkeypatch
     ):
-        """Test scalar descriptor methods with a stubbed integration backend."""
+        """Test scalar descriptor evaluation/caching via repeated single calls."""
         mwfn = Multiwfn(molden_file, run_path=tmp_path, has_spin=False)
 
         def fake_run(menu_cmd, menu_pattern, commands, descriptor):
@@ -752,8 +752,11 @@ class TestMultiwfnDescriptorBranches:
         assert result[1] == 3.0
         assert mwfn.get_descriptor("rho") is result
 
-        many = mwfn.get_descriptors(["rho", "fplus"])
-        assert set(many) == {"rho", "fplus"}
+        fplus = mwfn.get_descriptor("fplus")
+        assert fplus[1] == 5.0
+        assert mwfn.get_descriptor("fplus") is fplus
+        assert mwfn._results.atomic_descriptors is not None
+        assert set(mwfn._results.atomic_descriptors) >= {"rho", "fplus"}
 
     def test_get_vector(self, molden_file, tmp_path, monkeypatch):
         """Test vector descriptor assembly and caching."""
@@ -1075,6 +1078,34 @@ class TestMultiwfnRunStubs:
         assert mwfn.get_gaps() is gap_closed
         assert calls["n"] == 3
 
+    def test_get_gaps_unrestricted_typ_orbital_format(
+        self, mwfn, monkeypatch, tmp_path
+    ):
+        """Test gap extraction from unrestricted listing using `E(...)/Typ:` rows."""
+
+        def fake_run(commands, subdir=None):
+            del commands
+            stdout = (
+                " Basic information of all orbitals:\n"
+                "     1          E(au/eV):    -0.44095     -12.0000 Occ: 1.000000 Typ: A  (A   )\n"
+                "     2          E(au/eV):    -0.36750     -10.0000 Occ: 1.000000 Typ: A  (A   )\n"
+                "     3          E(au/eV):    -0.14700      -4.0000 Occ: 0.000000 Typ: A  (A   )\n"
+                "     4 (     1) E(au/eV):    -0.11025      -3.0000 Occ: 0.000000 Typ: B  (A   )\n"
+                "     5 (     2) E(au/eV):     0.03675       1.0000 Occ: 0.000000 Typ: B  (A   )\n"
+            )
+            return _make_run_result(tmp_path, subdir, stdout)
+
+        mwfn._has_spin = True
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+        gap = mwfn.get_gaps(n=1)
+
+        assert gap["orbitals"][2][0] == pytest.approx(-10.0)
+        assert gap["orbitals"][4][2] == "B"
+        assert gap["gaps"]["homo_index"] == 2
+        sequence = gap["gaps"]["sequence_ev"]
+        assert sequence[0][(1, 2)] == pytest.approx(2.0)
+        assert sequence[1][(2, 3)] == pytest.approx(6.0)
+
     def test_get_localization(self, mwfn, monkeypatch, tmp_path):
         """Test localization extraction and caching."""
         calls = {"n": 0}
@@ -1272,6 +1303,27 @@ class TestMultiwfnParserHelpers:
         with pytest.raises(ValueError, match="Upper occupation threshold"):
             mwfn._parse_somo_gaps(stdout, (0.8, 0.8))
 
+    def test_parse_orbital_list_old_and_unrestricted_formats(self, mwfn):
+        """Test orbital row parser for legacy and unrestricted output styles."""
+        stdout = (
+            " Basic information of all orbitals:\n"
+            " Orb:    17 Ene(au/eV):    -0.394388     -10.7318 Occ: 2.000000 "
+            "Type:A+B (A   )\n"
+            "    61 (    23) E(au/eV):    -0.11101      -3.0207 Occ: 0.000000 "
+            "Typ: B  (A   )\n"
+        )
+        parsed = mwfn._parse_orbital_list(stdout)
+
+        assert len(parsed) == 2
+        assert parsed[0]["index"] == 17
+        assert parsed[0]["energy_ev"] == pytest.approx(-10.7318)
+        assert parsed[0]["occupation"] == pytest.approx(2.0)
+        assert parsed[0]["type"] == "A+B"
+        assert parsed[1]["index"] == 61
+        assert parsed[1]["energy_ev"] == pytest.approx(-3.0207)
+        assert parsed[1]["occupation"] == pytest.approx(0.0)
+        assert parsed[1]["type"] == "B"
+
     def test_parse_surfanalysis_handles_signed_extrema(self, mwfn, tmp_path):
         """Test surfanalysis parsing with signed extrema values."""
         content = (
@@ -1421,6 +1473,12 @@ class TestPexpectSessionHelpers:
         fake_session._process_command(
             CommandStep("run", expect="needed", optional=True), use_robust=True
         )
+        fake_session._transcript = ["prompt in current folder? (y/n)"]
+        fake_session._last_command_pos = 0
+        fake_session._process_command(
+            CommandStep("run_required_buffered", expect="current folder"),
+            use_robust=True,
+        )
         fake_session._process_command(CommandStep(""), use_robust=False)
 
         assert ("send", "cmd") in events
@@ -1428,8 +1486,10 @@ class TestPexpectSessionHelpers:
         assert ("wait", 5.0) in events
         assert ("send", "run") in events
         assert ("send", "run_buffered") in events
+        assert ("send", "run_required_buffered") in events
         assert ("send", "skip") not in events
         assert ("send", "") in events
+        assert ("expect", "current folder") not in events
 
     def test_wait_for_progress_loop_timeout(self, fake_session, monkeypatch):
         """Test wait_for_progress early termination when idle timeout is reached."""

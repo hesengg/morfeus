@@ -9,7 +9,8 @@ your shell environment. Refer to the `Multiwfn manual`_ for installation instruc
 
 The optional dependency ``pexpect`` is required to run any function in this module.
 
-Caution: This module has only been tested with xTB derived molden files!
+Caution: This module has only been tested with molden files derived from xTB, PySCF and ORCA.
+The `molden2aim`_ utility is recommended to standardize wavefunction files.
 
 ******
 Module
@@ -120,3 +121,4 @@ For Multiwfn setup and menu-level details, see the `Multiwfn manual`_.
 
 .. _Multiwfn program: http://sobereva.com/multiwfn/
 .. _Multiwfn manual: http://sobereva.com/multiwfn/Multiwfn_manual.html
+.. _molden2aim: https://github.com/zorkzou/Molden2AIM

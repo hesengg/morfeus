@@ -38,11 +38,18 @@ LUMO_LINE_PATTERN = re.compile(
 )
 HOMO_LUMO_GAP_PATTERN = re.compile(rf"HOMO-LUMO gap:.*?({NUMBER_PATTERN})\s+eV\b")
 ORBITAL_LINE_PATTERN = re.compile(
-    (
-        rf"^\s*Orb:\s*(\d+).*?Ene\(au/eV\):\s*{NUMBER_PATTERN}\s+"
-        rf"({NUMBER_PATTERN})\s+Occ:\s*({NUMBER_PATTERN})\s+Type:\s*(A\+B|A|B)\b"
-    ),
-    flags=re.MULTILINE,
+    rf"""
+    ^\s*
+    (?:Orb:\s*)?
+    (?P<index>\d+)
+    (?:\s+\(\s*\d+\s*\))?
+    \s+
+    (?:Ene|E)\(au/eV\):
+    \s*{NUMBER_PATTERN}\s+(?P<energy_ev>{NUMBER_PATTERN})
+    \s+Occ:\s*(?P<occupation>{NUMBER_PATTERN})
+    \s+Typ(?:e)?\s*:\s*(?P<orbital_type>A\+B|A|B)\b
+    """,
+    flags=re.MULTILINE | re.VERBOSE,
 )
 SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
     "Only closed-shell single-determinant wavefunction is supported by this function"
@@ -490,11 +497,49 @@ class _PexpectSession:
             if not matched:
                 raise RuntimeError(
                     f"Expected pattern not found before command {cmd!r}: {pattern!r}"
-                    f"Expected pattern not found before command {cmd!r}: {pattern!r}"
                 )
         self.send(cmd)
         if not use_robust:
             self.read_available()
+
+    def _has_pattern_in_buffered_output(
+        self, pattern: str, debug_message: str | None = None
+    ) -> bool:
+        """Return True if pattern is present in buffered output."""
+        buffered_output = self.get_output_since_last_command()
+        pattern_found = re.search(pattern, buffered_output) is not None
+        if self._debug and pattern_found and debug_message:
+            print(debug_message)
+        return pattern_found
+
+    def _resolve_step_execution(
+        self, item: CommandStep, use_robust: bool
+    ) -> tuple[bool, str | None]:
+        """Resolve whether a command step should run and which expect to use."""
+        if not item.expect:
+            return True, None
+
+        if item.optional:
+            pattern_found = self.try_expect(item.expect, timeout=1.0)
+            if not pattern_found:
+                pattern_found = self._has_pattern_in_buffered_output(
+                    item.expect,
+                    "[DEBUG] Optional pattern found in buffered output",
+                )
+            if self._debug:
+                status = "found" if pattern_found else "not found"
+                print(f"[DEBUG] Optional pattern {status}: {item.expect!r}")
+            if not pattern_found:
+                return False, None
+            # Avoid matching the same already-consumed pattern twice.
+            return True, None
+
+        if use_robust and self._has_pattern_in_buffered_output(
+            item.expect, "[DEBUG] Required pattern found in buffered output"
+        ):
+            # Avoid expecting the same prompt again if it was already consumed.
+            return True, None
+        return True, item.expect
 
     def _process_command(
         self, item: str | CommandStep | WaitProgress, use_robust: bool
@@ -509,21 +554,9 @@ class _PexpectSession:
             self.wait_for_progress(max_wait=item.max_wait)
             return
 
-        command_expect = item.expect
-        if item.optional and item.expect:
-            pattern_found = self.try_expect(item.expect, timeout=1.0)
-            if not pattern_found:
-                buffered_output = self.get_output_since_last_command()
-                pattern_found = re.search(item.expect, buffered_output) is not None
-                if self._debug and pattern_found:
-                    print("[DEBUG] Optional pattern found in buffered output")
-            if self._debug:
-                status = "found" if pattern_found else "not found"
-                print(f"[DEBUG] Optional pattern {status}: {item.expect!r}")
-            if not pattern_found:
-                return
-            # Avoid matching the same already-consumed pattern twice.
-            command_expect = None
+        should_execute, command_expect = self._resolve_step_execution(item, use_robust)
+        if not should_execute:
+            return
 
         if item.cmd is not None:
             self._execute_command(item.cmd, command_expect, use_robust)
@@ -552,7 +585,7 @@ class _PexpectSession:
             Chunk string, "EOF" on end-of-file, or None on timeout.
         """
         try:
-            chunk = self._child.read_nonblocking(size=4096, timeout=0.5)
+            chunk = self._child.read_nonblocking(size=8192, timeout=0.5)
             return cast(str, chunk)
         except pexpect.TIMEOUT:
             if self._debug:
@@ -1053,7 +1086,7 @@ class Multiwfn:
         commands = [
             CommandStep("9", expect="9 Bond order analysis"),
             CommandStep(menu_cmd, expect=menu_pattern),
-            # WaitProgress(self._max_wait),
+            WaitProgress(self._max_wait),
             CommandStep("n", expect="current folder"),
             CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
@@ -1198,28 +1231,6 @@ class Multiwfn:
             return new_path
 
         return cub_file_path
-
-    def get_grids(
-        self,
-        descriptors: list[str],
-        grid_quality: str,
-        grid_file_name: str | None = None,
-    ) -> dict[str, Path]:
-        """Generate a grid (.cub) file for multiple real space function.
-
-        Args:
-            descriptors: List of descriptors.
-            grid_quality: Grid quality, one of 'low', 'medium', 'high'.
-            grid_file_name: Optional name for output cube file.
-
-        Returns:
-            Dictionary mapping descriptor name to generated grid file path.
-        """
-        grid_paths: dict[str, Path] = {}
-        for descriptor in descriptors:
-            grid_path = self.get_grid(descriptor, grid_quality, grid_file_name)
-            grid_paths[descriptor] = grid_path
-        return grid_paths
 
     def get_fukui(self) -> dict[str, dict[int, float]]:
         """Calculate Fukui functions.
@@ -1414,6 +1425,10 @@ class Multiwfn:
 
         Returns:
             Dictionary mapping atom index (1-based) to integrated density value.
+
+        Raises:
+            ValueError: If the descriptor is unsupported, vector-valued, requires grid
+                data, or is incompatible with the current spin state.
         """
         if (
             self._results.atomic_descriptors is not None
@@ -1421,14 +1436,17 @@ class Multiwfn:
         ):
             return self._results.atomic_descriptors[descriptor]
 
-        menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
-        descriptor_result = self._run_fuzzy_integration(
-            menu_cmd, menu_pattern, commands, descriptor
-        )
-        if self._results.atomic_descriptors is None:
-            self._results.atomic_descriptors = {}
-        self._results.atomic_descriptors[descriptor] = descriptor_result
-        return descriptor_result
+        try:
+            menu_cmd, menu_pattern, commands = self._get_descriptor_function(descriptor)
+            descriptor_result = self._run_fuzzy_integration(
+                menu_cmd, menu_pattern, commands, descriptor
+            )
+            if self._results.atomic_descriptors is None:
+                self._results.atomic_descriptors = {}
+            self._results.atomic_descriptors[descriptor] = descriptor_result
+            return descriptor_result
+        except ValueError as e:
+            raise e
 
     def _run_fuzzy_integration(
         self,
@@ -1445,21 +1463,6 @@ class Multiwfn:
         result = self.run_commands(command_sequence, subdir=descriptor)
         descriptor_result = self._parse_atomic_values(result.stdout)
         return descriptor_result
-
-    def get_descriptors(self, descriptors: list[str]) -> dict[str, dict[int, float]]:
-        """Calculate multiple atomic densities from integration in fuzzy atomic spaces.
-
-        Args:
-            descriptors: List of descriptors.
-
-        Returns:
-            Dictionary mapping descriptor name to {atom index: value}.
-        """
-        results: dict[str, dict[int, float]] = {}
-        for descriptor in descriptors:
-            result = self.get_descriptor(descriptor)
-            results[descriptor] = result
-        return results
 
     def get_electric_moments(self) -> dict[str, float]:
         """Calculate electric dipole/multipole moments."""
@@ -1810,11 +1813,16 @@ class Multiwfn:
         if not orbitals:
             raise RuntimeError("No orbitals available for gap analysis.")
 
-        _, _, occupied = self._split_orbitals_by_occupation(orbitals, lower, upper)
-        if not occupied:
-            raise RuntimeError("Could not identify doubly occupied orbitals.")
+        _, partially_occupied, occupied = self._split_orbitals_by_occupation(
+            orbitals, lower, upper
+        )
+        # Unrestricted orbital listings may contain only 1/0 occupations.
+        # In that case, fall back to the partially occupied bucket.
+        occupied_candidates = occupied or partially_occupied
+        if not occupied_candidates:
+            raise RuntimeError("Could not identify occupied orbitals.")
 
-        homo = max(occupied, key=lambda orb: orb["energy_ev"])
+        homo = max(occupied_candidates, key=lambda orb: orb["energy_ev"])
         homo_index = homo["index"]
 
         orbital_table: dict[int, tuple[float, float, str]] = {}
@@ -1848,16 +1856,15 @@ class Multiwfn:
 
     def _parse_orbital_list(self, stdout: str) -> list[dict[str, Any]]:
         """Parse orbital listing from `List all orbitals` output."""
-        orbitals: list[dict[str, Any]] = []
-        for match in ORBITAL_LINE_PATTERN.finditer(stdout):
-            orbitals.append(
-                {
-                    "index": int(match.group(1)),
-                    "energy_ev": self._parse_float(match.group(2)),
-                    "occupation": self._parse_float(match.group(3)),
-                    "type": match.group(4),
-                }
-            )
+        orbitals = [
+            {
+                "index": int(match["index"]),
+                "energy_ev": self._parse_float(match["energy_ev"]),
+                "occupation": self._parse_float(match["occupation"]),
+                "type": match["orbital_type"],
+            }
+            for match in ORBITAL_LINE_PATTERN.finditer(stdout)
+        ]
 
         if not orbitals:
             raise RuntimeError("Could not parse orbital listing from stdout.")
