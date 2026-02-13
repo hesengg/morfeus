@@ -1381,6 +1381,18 @@ class Multiwfn:
             result.stdout, analysis="Superdelocalizability analysis"
         )
         superdeloc_matrix = self._parse_superdelocalizabilities(result.stdout)
+        if not superdeloc_matrix["d_n"]:
+            nonempty_lines = [
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            ]
+            excerpt = "\n".join(nonempty_lines[-20:])
+            if excerpt:
+                excerpt = f"\nOutput excerpt:\n{excerpt}"
+            raise RuntimeError(
+                "Superdelocalizability analysis returned no atomic values; "
+                "Multiwfn output format may be unsupported."
+                f"{excerpt}"
+            )
 
         self._results.superdelocalizabilities = superdeloc_matrix
 
@@ -1764,13 +1776,55 @@ class Multiwfn:
     def _parse_superdelocalizabilities(
         self, stdout: str
     ) -> dict[str, dict[int, float]]:
-        """Parse superdelocalizability descriptors from stdout."""
-        return self._parse_atomic_table(
-            stdout,
-            header_keywords=["Atom", "D_N", "D_E"],
-            keys=["d_n", "d_e", "d_n_0", "d_e_0"],
-            stop_keyword="Sum of",
-        )
+        """Parse superdelocalizability descriptors from stdout.
+
+        Multiwfn output differs across versions/builds:
+        - Header labels may be `D_N`/`D_E` or `DN`/`DE`
+        - Rows may contain either 2 columns (D_N, D_E) or 4 columns
+          (D_N, D_E, D_N_0, D_E_0)
+        """
+        result: dict[str, dict[int, float]] = {
+            "d_n": {},
+            "d_e": {},
+            "d_n_0": {},
+            "d_e_0": {},
+        }
+        lines = stdout.splitlines()
+
+        atom_header_re = re.compile(r"\bAtom(?:\s+index)?\b", flags=re.IGNORECASE)
+        dn_header_re = re.compile(r"\bD[_\s]?N\b", flags=re.IGNORECASE)
+        de_header_re = re.compile(r"\bD[_\s]?E\b", flags=re.IGNORECASE)
+        row_re = re.compile(r"\s*(\d+)\([A-Za-z][a-z]?\s*\)?\s+(.*)$")
+
+        for i, line in enumerate(lines):
+            if (
+                atom_header_re.search(line)
+                and dn_header_re.search(line)
+                and de_header_re.search(line)
+            ):
+                for data_line in lines[i + 1 :]:
+                    if not data_line.strip():
+                        break
+                    if "sum of" in data_line.lower():
+                        break
+
+                    row_match = row_re.match(data_line)
+                    if row_match is None:
+                        continue
+
+                    atom_idx = int(row_match.group(1))
+                    values = re.findall(NUMBER_PATTERN, row_match.group(2))
+                    if len(values) < 2:
+                        continue
+
+                    result["d_n"][atom_idx] = self._parse_float(values[0])
+                    result["d_e"][atom_idx] = self._parse_float(values[1])
+                    if len(values) >= 4:
+                        result["d_n_0"][atom_idx] = self._parse_float(values[2])
+                        result["d_e_0"][atom_idx] = self._parse_float(values[3])
+                break
+
+        return result
 
     def _parse_electric_moments(self, stdout: str) -> dict[str, float]:
         """Parse electric moments from stdout."""

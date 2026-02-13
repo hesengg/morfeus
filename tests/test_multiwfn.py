@@ -315,7 +315,10 @@ class TestMultiwfnExampleFileMatrix:
             )
         else:
             assert "f_plus" in fukui
-            assert len(fukui["f_plus"]) > 0
+            assert len(fukui["f_plus"]) > 0, (
+                f"{diagnostics}; fukui_keys={sorted(fukui)}; "
+                f"f_plus_size={len(fukui.get('f_plus', {}))}"
+            )
 
         try:
             superdeloc = mwfn_case.get_superdelocalizabilities()
@@ -325,7 +328,10 @@ class TestMultiwfnExampleFileMatrix:
             )
         else:
             assert "d_n" in superdeloc
-            assert len(superdeloc["d_n"]) > 0
+            assert len(superdeloc["d_n"]) > 0, (
+                f"{diagnostics}; superdeloc_keys={sorted(superdeloc)}; "
+                f"d_n_size={len(superdeloc.get('d_n', {}))}"
+            )
 
 
 class TestMultiwfnWfnRestrictions:
@@ -1229,6 +1235,22 @@ class TestMultiwfnRunStubs:
         with pytest.raises(RuntimeError, match="single-determinant wavefunction"):
             mwfn.get_superdelocalizabilities()
 
+    def test_get_superdelocalizabilities_raise_on_empty_atomic_table(
+        self, mwfn, monkeypatch, tmp_path
+    ):
+        """Raise RuntimeError when superdelocalizability table cannot be parsed."""
+        stdout = "Atom      DN      DE\nSum of DN and DE\n"
+
+        def fake_run(commands, subdir=None):
+            del commands
+            return _make_run_result(tmp_path, subdir, stdout)
+
+        mwfn._has_spin = False
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+
+        with pytest.raises(RuntimeError, match="returned no atomic values"):
+            mwfn.get_superdelocalizabilities()
+
     def test_get_electric_moments(self, mwfn, monkeypatch, tmp_path):
         """Test electric-moment extraction from stdout."""
 
@@ -1407,6 +1429,20 @@ class TestMultiwfnParserHelpers:
         parsed_super = mwfn._parse_superdelocalizabilities(super_stdout)
         assert parsed_super["d_n"][1] == pytest.approx(1.10)
         assert parsed_super["d_e_0"][1] == pytest.approx(4.40)
+
+        super_stdout_two_col = (
+            "Atom      DN      DE\n"
+            "   1(C    0.55 1.25\n"
+            "   2(O    0.44 0.88\n"
+            "Sum of DN and DE\n"
+        )
+        parsed_super_two_col = mwfn._parse_superdelocalizabilities(
+            super_stdout_two_col
+        )
+        assert parsed_super_two_col["d_n"][1] == pytest.approx(0.55)
+        assert parsed_super_two_col["d_e"][2] == pytest.approx(0.88)
+        assert parsed_super_two_col["d_n_0"] == {}
+        assert parsed_super_two_col["d_e_0"] == {}
 
     def test_parse_atomic_values_and_chg(self, mwfn, tmp_path):
         """Test scalar atomic-value parser and chg-file parser."""
