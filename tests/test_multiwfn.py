@@ -1610,9 +1610,8 @@ class TestPexpectSessionHelpers:
 
     def test_try_expect_eof_with_non_string_after(self, fake_session):
         """Ensure EOF sentinels do not poison transcript with non-string objects."""
-        fake_session._child.before = (
-            "Only closed-shell single-determinant wavefunction is supported by this function"
-        )
+        p = "Only closed-shell single-determinant wavefunction is supported by this function"
+        fake_session._child.before = p
         fake_session._child.after = pexpect.EOF
         fake_session._child.expect_responses = [pexpect.EOF("eof")]
 
