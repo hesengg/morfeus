@@ -1369,10 +1369,9 @@ class Multiwfn:
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            CommandStep(
-                "0",
-                expect=r"(?i)(?:D[_\s]?N|0\s+Return)",
-            ),
+            # Prompt text after option 8 varies across Multiwfn builds; send "0"
+            # unconditionally to return to the previous menu.
+            CommandStep("0"),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="superdeloc")

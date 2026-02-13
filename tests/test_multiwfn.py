@@ -1189,9 +1189,7 @@ class TestMultiwfnRunStubs:
         superdeloc_return = superdeloc_commands[4]
         assert isinstance(superdeloc_return, CommandStep)
         assert superdeloc_return.cmd == "0"
-        assert superdeloc_return.expect is not None
-        assert "D[_\\s]?N" in superdeloc_return.expect
-        assert "0\\s+Return" in superdeloc_return.expect
+        assert superdeloc_return.expect is None
 
     def test_get_fukui_and_superdeloc_raise_on_single_determinant_error(
         self, mwfn, monkeypatch, tmp_path
