@@ -1372,7 +1372,9 @@ class Multiwfn:
             # Prompt text after option 8 varies across Multiwfn builds; send "0"
             # unconditionally to return to the previous menu.
             CommandStep("0"),
-            CommandStep("q", expect="gracefully"),
+            # Do not gate quit on a specific prompt here; conceptual-DFT submenu
+            # prompts vary across Multiwfn builds.
+            CommandStep("q"),
         ]
         result = self.run_commands(commands, subdir="superdeloc")
         self._raise_if_single_determinant_wavefunction_error(

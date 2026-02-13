@@ -48,6 +48,19 @@ def _infer_has_spin_from_name(file_path: Path) -> bool:
     )
 
 
+def _infer_multiplicity_from_name(file_path: Path) -> int:
+    """Infer multiplicity from fixture filename."""
+    name = file_path.stem.lower()
+    if "triplet" in name:
+        return 3
+    if "singlet" in name:
+        return 1
+    raise ValueError(
+        f"Could not infer multiplicity from file name {file_path.name!r}; "
+        "expected 'singlet' or 'triplet'."
+    )
+
+
 def _infer_unrestricted_from_name(file_path: Path) -> bool:
     """Infer unrestricted wavefunction flag from fixture filename."""
     name = file_path.stem.lower()
@@ -258,10 +271,22 @@ class TestMultiwfnExampleFileMatrix:
         )
 
     def test_spin_and_wavefunction_restricted_methods(
-        self, mwfn_case, wavefunction_case
+        self, wavefunction_case, tmp_path
     ) -> None:
         """Validate spin-gated descriptor and conceptual-DFT behavior."""
-        _, has_spin, is_unrestricted = wavefunction_case
+        file_path, has_spin, is_unrestricted = wavefunction_case
+        multiplicity = _infer_multiplicity_from_name(file_path)
+        reference_type = "unrestricted" if is_unrestricted else "restricted"
+        diagnostics = (
+            f"file={file_path.name}, multiplicity={multiplicity}, has_spin={has_spin}, "
+            f"reference={reference_type}"
+        )
+        mwfn_case = Multiwfn(
+            file_path,
+            run_path=tmp_path / f"{file_path.stem}_spin_diag",
+            has_spin=has_spin,
+            debug=True,
+        )
 
         if has_spin:
             with pytest.raises(ValueError, match="open-shell systems"):
@@ -285,7 +310,9 @@ class TestMultiwfnExampleFileMatrix:
         try:
             fukui = mwfn_case.get_fukui()
         except RuntimeError as exc:
-            assert "single-determinant wavefunction" in str(exc)
+            assert "single-determinant wavefunction" in str(exc), (
+                f"{diagnostics}; fukui_error={exc}"
+            )
         else:
             assert "f_plus" in fukui
             assert len(fukui["f_plus"]) > 0
@@ -293,13 +320,14 @@ class TestMultiwfnExampleFileMatrix:
         try:
             superdeloc = mwfn_case.get_superdelocalizabilities()
         except RuntimeError as exc:
-            assert "single-determinant wavefunction" in str(exc)
+            assert "single-determinant wavefunction" in str(exc), (
+                f"{diagnostics}; superdeloc_error={exc}"
+            )
         else:
             assert "d_n" in superdeloc
             assert len(superdeloc["d_n"]) > 0
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnWfnRestrictions:
     """Validate model restrictions when using .wfn wavefunction files."""
 
@@ -342,7 +370,6 @@ class TestMultiwfnWfnRestrictions:
         assert str(excinfo.value) == WFN_NO_BASIS_FUNCTION_INFORMATION_ERROR
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnCharges:
     """Test charge calculation methods."""
 
@@ -430,7 +457,6 @@ class TestMultiwfnCharges:
         assert charges1 is charges2
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnSurface:
     """Test surface analysis methods."""
 
@@ -534,7 +560,6 @@ class TestMultiwfnSurface:
         assert surface1 is surface2
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnDensities:
     """Test density calculation from cube files."""
 
@@ -569,7 +594,6 @@ class TestMultiwfnDensities:
         assert densities1 is densities2
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnParsing:
     """Test parsing methods."""
 
@@ -645,7 +669,6 @@ class TestMultiwfnParsing:
         assert result["raw"] == ""
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnInitialization:
     """Test Multiwfn initialization."""
 
@@ -681,7 +704,6 @@ class TestMultiwfnInitialization:
         assert mwfn._has_spin is None
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnResults:
     """Test results caching and access."""
 
@@ -742,7 +764,6 @@ class TestMultiwfnResults:
         assert "rho" in options["descriptors_fast"]
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnBatchBehavior:
     """Test descriptor/grid API behavior on invalid entries."""
 
@@ -763,7 +784,6 @@ class TestMultiwfnBatchBehavior:
             mwfn.get_grid("invalid_descriptor", grid_quality="low")
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnBondOrders:
     """Test bond order calculation methods."""
 
@@ -784,7 +804,6 @@ class TestMultiwfnBondOrders:
             mwfn.get_bond_order(model="wilberg")
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnSettingsAndHelpers:
     """Test helper/configuration methods and utility behavior."""
 
@@ -889,7 +908,6 @@ class TestMultiwfnSettingsAndHelpers:
         assert len(mwfn._results.citations) == len(citations_before) + 1
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnDescriptorBranches:
     """Test descriptor selection and spin-dependent branches."""
 
@@ -1011,7 +1029,6 @@ class TestMultiwfnDescriptorBranches:
             mwfn.get_vector("invalid")
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnRunStubs:
     """Test methods that invoke Multiwfn by stubbing run_commands."""
 
@@ -1357,7 +1374,6 @@ class TestMultiwfnRunStubs:
         assert calls["n"] == 1
 
 
-@pytest.mark.multiwfn
 class TestMultiwfnParserHelpers:
     """Test parser helper methods with synthetic output data."""
 
@@ -1577,7 +1593,6 @@ class TestMultiwfnParserHelpers:
         assert stats["extrema_max"] == pytest.approx(0.51741287)
 
 
-@pytest.mark.multiwfn
 class TestPexpectSessionHelpers:
     """Test pexpect-session helper methods without running external executables."""
 
