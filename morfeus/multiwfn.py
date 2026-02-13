@@ -51,8 +51,17 @@ ORBITAL_LINE_PATTERN = re.compile(
     """,
     flags=re.MULTILINE | re.VERBOSE,
 )
-SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
+SINGLE_DETERMINANT_WFN_ERROR_TEXT = (
     "Only closed-shell single-determinant wavefunction is supported by this function"
+)
+# Multiwfn variants differ slightly in spacing/case/hyphenation; match both forms.
+SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
+    rf"{re.escape(SINGLE_DETERMINANT_WFN_ERROR_TEXT)}"
+    r"|Only\s+closed-shell\s+single\s+determinant\s+wavefunction\s+"
+    r"is\s+supported\s+by\s+this\s+function"
+)
+SINGLE_DETERMINANT_WFN_ERROR_RE = re.compile(
+    SINGLE_DETERMINANT_WFN_ERROR_PATTERN, flags=re.IGNORECASE
 )
 
 
@@ -1695,9 +1704,9 @@ class Multiwfn:
         self, stdout: str, analysis: str
     ) -> None:
         """Raise a clear error for unsupported multi-determinant wavefunctions."""
-        if SINGLE_DETERMINANT_WFN_ERROR_PATTERN in stdout:
+        if SINGLE_DETERMINANT_WFN_ERROR_RE.search(stdout):
             raise RuntimeError(
-                f"{analysis} failed: {SINGLE_DETERMINANT_WFN_ERROR_PATTERN}."
+                f"{analysis} failed: {SINGLE_DETERMINANT_WFN_ERROR_TEXT}."
             )
 
     def _parse_fukui(self, stdout: str) -> dict[str, dict[int, float]]:
