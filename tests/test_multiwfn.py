@@ -1414,9 +1414,7 @@ class TestMultiwfnParserHelpers:
             "   2(O    0.44 0.88\n"
             "Sum of DN and DE\n"
         )
-        parsed_super_two_col = mwfn._parse_superdelocalizabilities(
-            super_stdout_two_col
-        )
+        parsed_super_two_col = mwfn._parse_superdelocalizabilities(super_stdout_two_col)
         assert parsed_super_two_col["d_n"][1] == pytest.approx(0.55)
         assert parsed_super_two_col["d_e"][2] == pytest.approx(0.88)
         assert parsed_super_two_col["d_n_0"] == {}
