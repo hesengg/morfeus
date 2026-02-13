@@ -59,6 +59,7 @@ SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
     rf"{SINGLE_DETERMINANT_WFN_ERROR_TEXT}"
     r"|Only\s+closed-shell\s+single\s+determinant\s+wavefunction\s+"
     r"is\s+supported\s+by\s+this\s+function"
+    r"|single[-\s]?determinant\s+wavefunction\s+is\s+supported\s+by\s+this\s+function"
 )
 SINGLE_DETERMINANT_WFN_ERROR_RE = re.compile(
     SINGLE_DETERMINANT_WFN_ERROR_PATTERN, flags=re.IGNORECASE
@@ -537,6 +538,15 @@ class _PexpectSession:
             pattern = expect
             matched = self.expect(pattern)
             if not matched:
+                # Some Multiwfn builds emit the single-determinant warning and then
+                # change prompts abruptly. Surface this domain error instead of a
+                # generic prompt-mismatch RuntimeError.
+                transcript = self.stdout
+                buffered = self.get_output_since_last_command()
+                if SINGLE_DETERMINANT_WFN_ERROR_RE.search(buffered) or (
+                    transcript and SINGLE_DETERMINANT_WFN_ERROR_RE.search(transcript)
+                ):
+                    raise RuntimeError(SINGLE_DETERMINANT_WFN_ERROR_TEXT)
                 raise RuntimeError(
                     f"Expected pattern not found before command {cmd!r}: {pattern!r}"
                 )
@@ -1316,12 +1326,7 @@ class Multiwfn:
             ),
             CommandStep(
                 "0",
-                expect=(
-                    r"(Fukui potential|0 Return|0 Show molecular structure and view "
-                    r"orbitals|0\s+Return|0\s+Show molecular structure and view "
-                    r"orbitals)"
-                ),
-                optional=True,
+                expect=r"(Fukui potential|0 Return)",
             ),
             CommandStep("q", expect="gracefully"),
         ]
@@ -1364,14 +1369,7 @@ class Multiwfn:
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            CommandStep(
-                "0",
-                expect=(
-                    r"(0 Return|0 Show molecular structure and view orbitals|"
-                    r"0\s+Return|0\s+Show molecular structure and view orbitals)"
-                ),
-                optional=True,
-            ),
+            CommandStep("0", expect="0 Return"),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="superdeloc")
