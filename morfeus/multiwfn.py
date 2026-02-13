@@ -1389,6 +1389,7 @@ class Multiwfn:
             if excerpt:
                 excerpt = f"\nOutput excerpt:\n{excerpt}"
             raise RuntimeError(
+                f"{SINGLE_DETERMINANT_WFN_ERROR_TEXT}. "
                 "Superdelocalizability analysis returned no atomic values; "
                 "Multiwfn output format may be unsupported."
                 f"{excerpt}"
