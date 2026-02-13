@@ -360,12 +360,25 @@ class _PexpectSession:
         self._transcript: list[str] = []
         self._last_command_pos = 0
 
+    @staticmethod
+    def _coerce_output_chunk(chunk: Any) -> str:
+        """Normalize pexpect output chunks to text for transcript storage."""
+        if chunk is None:
+            return ""
+        if isinstance(chunk, str):
+            return chunk
+        return str(chunk)
+
+    def _append_transcript(self, chunk: Any) -> None:
+        """Append normalized output chunk to transcript."""
+        self._transcript.append(self._coerce_output_chunk(chunk))
+
     def read_available(self) -> None:
         """Read available output without blocking."""
         try:
             chunk = self._child.read_nonblocking(size=4096, timeout=0.1)
             if chunk:
-                self._transcript.append(chunk)
+                self._append_transcript(chunk)
         except (pexpect.TIMEOUT, pexpect.EOF):
             pass
 
@@ -430,8 +443,8 @@ class _PexpectSession:
 
         try:
             self._child.expect(pattern, timeout=self._expect_timeout)
-            self._transcript.append(self._child.before or "")
-            self._transcript.append(self._child.after or "")
+            self._append_transcript(self._child.before)
+            self._append_transcript(self._child.after)
             if self._debug:
                 print("[DEBUG] Got match")
             return True
@@ -445,8 +458,8 @@ class _PexpectSession:
                 print(f"Recent output: {recent_output[-500:]}")
             return False
         except pexpect.EOF:
-            self._transcript.append(self._child.before or "")
-            self._transcript.append(self._child.after or "")
+            self._append_transcript(self._child.before)
+            self._append_transcript(self._child.after)
             if self._debug:
                 print(f"[WARN] EOF while waiting for: {pattern!r}")
             return False
@@ -467,8 +480,8 @@ class _PexpectSession:
             print(f"[DEBUG] Try expecting: {pattern!r} (timeout={timeout}s)")
         try:
             self._child.expect(pattern, timeout=timeout)
-            self._transcript.append(self._child.before or "")
-            self._transcript.append(self._child.after or "")
+            self._append_transcript(self._child.before)
+            self._append_transcript(self._child.after)
             if self._debug:
                 print("[DEBUG] Got match")
             return True
@@ -478,10 +491,10 @@ class _PexpectSession:
                 print("[DEBUG] Pattern not found (optional)")
             return False
         except pexpect.EOF:
-            before = self._child.before or ""
-            after = self._child.after or ""
-            self._transcript.append(before)
-            self._transcript.append(after)
+            before = self._coerce_output_chunk(self._child.before)
+            after = self._coerce_output_chunk(self._child.after)
+            self._append_transcript(before)
+            self._append_transcript(after)
             if self._debug:
                 print("[DEBUG] EOF while checking optional pattern")
             return re.search(pattern, f"{before}{after}") is not None
@@ -493,7 +506,7 @@ class _PexpectSession:
         except pexpect.TIMEOUT:
             if self._debug:
                 print("[WARN] Timeout waiting for EOF")
-        self._transcript.append(self._child.before or "")
+        self._append_transcript(self._child.before)
         if self._child.isalive():
             self._child.close()
 
@@ -656,7 +669,7 @@ class _PexpectSession:
         Returns:
             True when waiting should stop.
         """
-        self._transcript.append(chunk)
+        self._append_transcript(chunk)
         if self._debug:
             print(f"[DEBUG] Read chunk while waiting: {chunk!r}")
         state.last_activity = time.monotonic()
