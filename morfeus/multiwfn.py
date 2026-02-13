@@ -1348,6 +1348,8 @@ class Multiwfn:
 
         Raises:
             ValueError: If the system is open-shell or spin is undefined.
+            RuntimeError: If Multiwfn reports unsupported wavefunction type or no
+                superdelocalizability table can be parsed from output.
         """
         if self._has_spin is None:
             raise ValueError(
@@ -1783,6 +1785,13 @@ class Multiwfn:
         - Header labels may be `D_N`/`D_E` or `DN`/`DE`
         - Rows may contain either 2 columns (D_N, D_E) or 4 columns
           (D_N, D_E, D_N_0, D_E_0)
+
+        Args:
+            stdout: Multiwfn output text containing the superdelocalizability table.
+
+        Returns:
+            Mapping with keys `d_n`, `d_e`, `d_n_0`, and `d_e_0`, each containing
+            atom-indexed values when available.
         """
         result: dict[str, dict[int, float]] = {
             "d_n": {},
