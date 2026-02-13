@@ -1608,6 +1608,18 @@ class TestPexpectSessionHelpers:
         fake_session._child.expect_responses = [pexpect.TIMEOUT("timeout")]
         assert not fake_session.try_expect("pattern", timeout=0.1)
 
+    def test_try_expect_eof_with_non_string_after(self, fake_session):
+        """Ensure EOF sentinels do not poison transcript with non-string objects."""
+        fake_session._child.before = (
+            "Only closed-shell single-determinant wavefunction is supported by this function"
+        )
+        fake_session._child.after = pexpect.EOF
+        fake_session._child.expect_responses = [pexpect.EOF("eof")]
+
+        assert fake_session.try_expect("single-determinant", timeout=0.1)
+        assert "single-determinant wavefunction" in fake_session.stdout
+        assert isinstance(fake_session.stdout, str)
+
     def test_read_helpers_and_exit(self, fake_session):
         """Test read_nonblocking wrappers and wait_for_exit behavior."""
         fake_session._child.read_responses = ["chunk"]
