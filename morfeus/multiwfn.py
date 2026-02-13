@@ -56,7 +56,7 @@ SINGLE_DETERMINANT_WFN_ERROR_TEXT = (
 )
 # Multiwfn variants differ slightly in spacing/case/hyphenation; match both forms.
 SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
-    rf"{re.escape(SINGLE_DETERMINANT_WFN_ERROR_TEXT)}"
+    rf"{SINGLE_DETERMINANT_WFN_ERROR_TEXT}"
     r"|Only\s+closed-shell\s+single\s+determinant\s+wavefunction\s+"
     r"is\s+supported\s+by\s+this\s+function"
 )
@@ -444,6 +444,12 @@ class _PexpectSession:
                 )
                 print(f"Recent output: {recent_output[-500:]}")
             return False
+        except pexpect.EOF:
+            self._transcript.append(self._child.before or "")
+            self._transcript.append(self._child.after or "")
+            if self._debug:
+                print(f"[WARN] EOF while waiting for: {pattern!r}")
+            return False
 
     def try_expect(self, pattern: str, timeout: float = 1.0) -> bool:
         """Try to match a pattern with short timeout. Silent on timeout.
@@ -471,6 +477,14 @@ class _PexpectSession:
             if self._debug:
                 print("[DEBUG] Pattern not found (optional)")
             return False
+        except pexpect.EOF:
+            before = self._child.before or ""
+            after = self._child.after or ""
+            self._transcript.append(before)
+            self._transcript.append(after)
+            if self._debug:
+                print("[DEBUG] EOF while checking optional pattern")
+            return re.search(pattern, f"{before}{after}") is not None
 
     def wait_for_exit(self) -> None:
         """Wait for process to exit."""
