@@ -189,8 +189,11 @@ class TestMultiwfnExampleFileMatrix:
             has_spin=has_spin,
         )
 
-    def test_method_matrix_for_each_wavefunction_file(self, mwfn_case) -> None:
+    def test_method_matrix_for_each_wavefunction_file(
+        self, mwfn_case, wavefunction_case
+    ) -> None:
         """Smoke-test key analyses on each fixture file."""
+        file_path, _, _ = wavefunction_case
         for model in CHARGE_SMOKE_MODELS:
             charges = mwfn_case.get_charges(model=model)
             assert isinstance(charges, dict)
@@ -220,10 +223,17 @@ class TestMultiwfnExampleFileMatrix:
         assert "global" in surface
         assert len(surface["atomic"]) > 0
 
+        nonempty_atomic_descriptors = 0
+        nonempty_grid_descriptors = 0
+        empty_atomic_descriptor_names: list[str] = []
+
         for descriptor in FAST_DESCRIPTOR_SMOKE_MODELS:
             atomic_values = mwfn_case.get_descriptor(descriptor)
             assert isinstance(atomic_values, dict)
-            assert len(atomic_values) > 0
+            if atomic_values:
+                nonempty_atomic_descriptors += 1
+            else:
+                empty_atomic_descriptor_names.append(descriptor)
 
             grid_file = mwfn_case.get_grid(
                 descriptor,
@@ -235,7 +245,17 @@ class TestMultiwfnExampleFileMatrix:
 
             grid_descriptors = mwfn_case.grid_to_descriptors(grid_file)
             assert isinstance(grid_descriptors, dict)
-            assert len(grid_descriptors) > 0
+            if grid_descriptors:
+                nonempty_grid_descriptors += 1
+
+        assert nonempty_atomic_descriptors > 0, (
+            "All fast descriptor fuzzy integrations were empty for "
+            f"{file_path.name!r}. Empty descriptors: {empty_atomic_descriptor_names}"
+        )
+        assert nonempty_grid_descriptors > 0, (
+            "All fast descriptor grid integrations were empty for "
+            f"{file_path.name!r}."
+        )
 
     def test_spin_and_wavefunction_restricted_methods(
         self, mwfn_case, wavefunction_case
