@@ -1314,7 +1314,14 @@ class Multiwfn:
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            CommandStep("0", expect=r"(Fukui potential|0 Return)"),
+            CommandStep(
+                "0",
+                expect=(
+                    r"(Fukui potential|0\s+Return|0\s+Show molecular structure and "
+                    r"view orbitals)"
+                ),
+                optional=True,
+            ),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="fukui")
@@ -1356,7 +1363,11 @@ class Multiwfn:
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            CommandStep("0", expect="0 Return"),
+            CommandStep(
+                "0",
+                expect=r"(0\s+Return|0\s+Show molecular structure and view orbitals)",
+                optional=True,
+            ),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="superdeloc")
