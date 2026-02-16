@@ -15,7 +15,7 @@ setuptools.setup(
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
     url=URL,
-    packages=setuptools.find_packages(),
+    packages=["morfeus"],
     package_data={"morfeus": ["py.typed"]},
     python_requires=">=3.10",
     install_requires=["fire", "numpy", "packaging", "scipy"],
