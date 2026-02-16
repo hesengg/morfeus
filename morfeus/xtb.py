@@ -92,6 +92,7 @@ class XTB:
         self._electronic_temperature = electronic_temperature
         self._n_processes = n_processes
         self._env_variables = env_variables
+        self._run_path = run_path
 
         self._default_xtb_command = (
             f"xtb {XTB._xyz_input_file} --json --chrg {self._charge}"
