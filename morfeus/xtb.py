@@ -847,21 +847,21 @@ class XTB:
 
         return h_bond_corrections
 
-    def get_molden(self) -> Path:
+    def gen_molden_file(self) -> Path:
         """Generate molden file for the molecule."""
         if self._run_path is None:
             raise ValueError("Molden file generation requires 'run_path' to be set.")
         self._run_xtb("molden")
         return self._run_path / XTB._xtb_molden_file
 
-    def get_density(self) -> Path:
+    def gen_density_file(self) -> Path:
         """Generate electron density cube file for the molecule."""
         if self._run_path is None:
             raise ValueError("Density file generation requires 'run_path' to be set.")
         self._run_xtb("density")
         return self._run_path / XTB._xtb_density_cube_file
 
-    def get_spin_density(self) -> Path:
+    def gen_spin_density_file(self) -> Path:
         """Generate spin density cube file for the molecule."""
         if self._run_path is None:
             raise ValueError(
@@ -975,12 +975,8 @@ class XTB:
                 )
 
             # Return error if xtb fails
-            err_file = run_folder / "xtb.err"
-            if err_file.exists():
-                with open(err_file, "r", encoding="utf8") as f:
-                    err_content = f.read()
-            else:
-                err_content = ""
+            with open(run_folder / "xtb.err", "r", encoding="utf8") as f:
+                err_content = f.read()
 
             if not re.search(r"(?<!ab)normal termination of xtb", err_content):
                 with open(run_folder / "xtb.out", "r", encoding="utf8") as f:
@@ -989,11 +985,7 @@ class XTB:
                     error = (
                         out_content[start_error_idx:]
                         if start_error_idx != -1
-                        else (
-                            err_content
-                            if err_content
-                            else "xtb process failed with no error output"
-                        )
+                        else err_content
                     )
                 raise RuntimeError(f"xtb calculation failed. Error:\n{error}")
 
