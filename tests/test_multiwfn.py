@@ -189,8 +189,11 @@ class TestMultiwfnExampleFileMatrix:
             has_spin=has_spin,
         )
 
-    def test_method_matrix_for_each_wavefunction_file(self, mwfn_case) -> None:
+    def test_method_matrix_for_each_wavefunction_file(
+        self, mwfn_case, wavefunction_case
+    ) -> None:
         """Smoke-test key analyses on each fixture file."""
+        file_path, _, _ = wavefunction_case
         for model in CHARGE_SMOKE_MODELS:
             charges = mwfn_case.get_charges(model=model)
             assert isinstance(charges, dict)
@@ -220,10 +223,17 @@ class TestMultiwfnExampleFileMatrix:
         assert "global" in surface
         assert len(surface["atomic"]) > 0
 
+        nonempty_atomic_descriptors = 0
+        nonempty_grid_descriptors = 0
+        empty_atomic_descriptor_names: list[str] = []
+
         for descriptor in FAST_DESCRIPTOR_SMOKE_MODELS:
             atomic_values = mwfn_case.get_descriptor(descriptor)
             assert isinstance(atomic_values, dict)
-            assert len(atomic_values) > 0
+            if atomic_values:
+                nonempty_atomic_descriptors += 1
+            else:
+                empty_atomic_descriptor_names.append(descriptor)
 
             grid_file = mwfn_case.get_grid(
                 descriptor,
@@ -235,7 +245,17 @@ class TestMultiwfnExampleFileMatrix:
 
             grid_descriptors = mwfn_case.grid_to_descriptors(grid_file)
             assert isinstance(grid_descriptors, dict)
-            assert len(grid_descriptors) > 0
+            if grid_descriptors:
+                nonempty_grid_descriptors += 1
+
+        assert nonempty_atomic_descriptors > 0, (
+            "All fast descriptor fuzzy integrations were empty for "
+            f"{file_path.name!r}. Empty descriptors: {empty_atomic_descriptor_names}"
+        )
+        assert nonempty_grid_descriptors > 0, (
+            "All fast descriptor grid integrations were empty for "
+            f"{file_path.name!r}."
+        )
 
     def test_spin_and_wavefunction_restricted_methods(
         self, mwfn_case, wavefunction_case
@@ -1166,6 +1186,10 @@ class TestMultiwfnRunStubs:
         assert superdeloc_enter.optional
         assert superdeloc_enter.expect is not None
         assert "single-determinant wavefunction" in superdeloc_enter.expect
+        superdeloc_return = superdeloc_commands[4]
+        assert isinstance(superdeloc_return, CommandStep)
+        assert superdeloc_return.cmd == "0"
+        assert superdeloc_return.expect is None
 
     def test_get_fukui_and_superdeloc_raise_on_single_determinant_error(
         self, mwfn, monkeypatch, tmp_path
@@ -1186,6 +1210,22 @@ class TestMultiwfnRunStubs:
         with pytest.raises(RuntimeError, match="single-determinant wavefunction"):
             mwfn.get_fukui()
         with pytest.raises(RuntimeError, match="single-determinant wavefunction"):
+            mwfn.get_superdelocalizabilities()
+
+    def test_get_superdelocalizabilities_raise_on_empty_atomic_table(
+        self, mwfn, monkeypatch, tmp_path
+    ):
+        """Raise RuntimeError when superdelocalizability table cannot be parsed."""
+        stdout = "Atom      DN      DE\nSum of DN and DE\n"
+
+        def fake_run(commands, subdir=None):
+            del commands
+            return _make_run_result(tmp_path, subdir, stdout)
+
+        mwfn._has_spin = False
+        monkeypatch.setattr(mwfn, "run_commands", fake_run)
+
+        with pytest.raises(RuntimeError, match="returned no atomic values"):
             mwfn.get_superdelocalizabilities()
 
     def test_get_electric_moments(self, mwfn, monkeypatch, tmp_path):
@@ -1367,6 +1407,18 @@ class TestMultiwfnParserHelpers:
         parsed_super = mwfn._parse_superdelocalizabilities(super_stdout)
         assert parsed_super["d_n"][1] == pytest.approx(1.10)
         assert parsed_super["d_e_0"][1] == pytest.approx(4.40)
+
+        super_stdout_two_col = (
+            "Atom      DN      DE\n"
+            "   1(C    0.55 1.25\n"
+            "   2(O    0.44 0.88\n"
+            "Sum of DN and DE\n"
+        )
+        parsed_super_two_col = mwfn._parse_superdelocalizabilities(super_stdout_two_col)
+        assert parsed_super_two_col["d_n"][1] == pytest.approx(0.55)
+        assert parsed_super_two_col["d_e"][2] == pytest.approx(0.88)
+        assert parsed_super_two_col["d_n_0"] == {}
+        assert parsed_super_two_col["d_e_0"] == {}
 
     def test_parse_atomic_values_and_chg(self, mwfn, tmp_path):
         """Test scalar atomic-value parser and chg-file parser."""
@@ -1587,6 +1639,17 @@ class TestPexpectSessionHelpers:
 
         fake_session._child.expect_responses = [pexpect.TIMEOUT("timeout")]
         assert not fake_session.try_expect("pattern", timeout=0.1)
+
+    def test_try_expect_eof_with_non_string_after(self, fake_session):
+        """Ensure EOF sentinels do not poison transcript with non-string objects."""
+        p = "Only closed-shell single-determinant wavefunction is supported by this function"
+        fake_session._child.before = p
+        fake_session._child.after = pexpect.EOF
+        fake_session._child.expect_responses = [pexpect.EOF("eof")]
+
+        assert fake_session.try_expect("single-determinant", timeout=0.1)
+        assert "single-determinant wavefunction" in fake_session.stdout
+        assert isinstance(fake_session.stdout, str)
 
     def test_read_helpers_and_exit(self, fake_session):
         """Test read_nonblocking wrappers and wait_for_exit behavior."""

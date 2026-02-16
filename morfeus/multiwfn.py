@@ -51,8 +51,18 @@ ORBITAL_LINE_PATTERN = re.compile(
     """,
     flags=re.MULTILINE | re.VERBOSE,
 )
-SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
+SINGLE_DETERMINANT_WFN_ERROR_TEXT = (
     "Only closed-shell single-determinant wavefunction is supported by this function"
+)
+# Multiwfn variants differ slightly in spacing/case/hyphenation; match both forms.
+SINGLE_DETERMINANT_WFN_ERROR_PATTERN = (
+    rf"{SINGLE_DETERMINANT_WFN_ERROR_TEXT}"
+    r"|Only\s+closed-shell\s+single\s+determinant\s+wavefunction\s+"
+    r"is\s+supported\s+by\s+this\s+function"
+    r"|single[-\s]?determinant\s+wavefunction\s+is\s+supported\s+by\s+this\s+function"
+)
+SINGLE_DETERMINANT_WFN_ERROR_RE = re.compile(
+    SINGLE_DETERMINANT_WFN_ERROR_PATTERN, flags=re.IGNORECASE
 )
 
 
@@ -351,12 +361,25 @@ class _PexpectSession:
         self._transcript: list[str] = []
         self._last_command_pos = 0
 
+    @staticmethod
+    def _coerce_output_chunk(chunk: Any) -> str:
+        """Normalize pexpect output chunks to text for transcript storage."""
+        if chunk is None:
+            return ""
+        if isinstance(chunk, str):
+            return chunk
+        return str(chunk)
+
+    def _append_transcript(self, chunk: Any) -> None:
+        """Append normalized output chunk to transcript."""
+        self._transcript.append(self._coerce_output_chunk(chunk))
+
     def read_available(self) -> None:
         """Read available output without blocking."""
         try:
             chunk = self._child.read_nonblocking(size=4096, timeout=0.1)
             if chunk:
-                self._transcript.append(chunk)
+                self._append_transcript(chunk)
         except (pexpect.TIMEOUT, pexpect.EOF):
             pass
 
@@ -421,8 +444,8 @@ class _PexpectSession:
 
         try:
             self._child.expect(pattern, timeout=self._expect_timeout)
-            self._transcript.append(self._child.before or "")
-            self._transcript.append(self._child.after or "")
+            self._append_transcript(self._child.before)
+            self._append_transcript(self._child.after)
             if self._debug:
                 print("[DEBUG] Got match")
             return True
@@ -434,6 +457,12 @@ class _PexpectSession:
                     f"[WARN] Timeout ({self._expect_timeout}s) waiting for: {pattern!r}"
                 )
                 print(f"Recent output: {recent_output[-500:]}")
+            return False
+        except pexpect.EOF:
+            self._append_transcript(self._child.before)
+            self._append_transcript(self._child.after)
+            if self._debug:
+                print(f"[WARN] EOF while waiting for: {pattern!r}")
             return False
 
     def try_expect(self, pattern: str, timeout: float = 1.0) -> bool:
@@ -452,8 +481,8 @@ class _PexpectSession:
             print(f"[DEBUG] Try expecting: {pattern!r} (timeout={timeout}s)")
         try:
             self._child.expect(pattern, timeout=timeout)
-            self._transcript.append(self._child.before or "")
-            self._transcript.append(self._child.after or "")
+            self._append_transcript(self._child.before)
+            self._append_transcript(self._child.after)
             if self._debug:
                 print("[DEBUG] Got match")
             return True
@@ -462,6 +491,14 @@ class _PexpectSession:
             if self._debug:
                 print("[DEBUG] Pattern not found (optional)")
             return False
+        except pexpect.EOF:
+            before = self._coerce_output_chunk(self._child.before)
+            after = self._coerce_output_chunk(self._child.after)
+            self._append_transcript(before)
+            self._append_transcript(after)
+            if self._debug:
+                print("[DEBUG] EOF while checking optional pattern")
+            return re.search(pattern, f"{before}{after}") is not None
 
     def wait_for_exit(self) -> None:
         """Wait for process to exit."""
@@ -470,7 +507,7 @@ class _PexpectSession:
         except pexpect.TIMEOUT:
             if self._debug:
                 print("[WARN] Timeout waiting for EOF")
-        self._transcript.append(self._child.before or "")
+        self._append_transcript(self._child.before)
         if self._child.isalive():
             self._child.close()
 
@@ -501,6 +538,15 @@ class _PexpectSession:
             pattern = expect
             matched = self.expect(pattern)
             if not matched:
+                # Some Multiwfn builds emit the single-determinant warning and then
+                # change prompts abruptly. Surface this domain error instead of a
+                # generic prompt-mismatch RuntimeError.
+                transcript = self.stdout
+                buffered = self.get_output_since_last_command()
+                if SINGLE_DETERMINANT_WFN_ERROR_RE.search(buffered) or (
+                    transcript and SINGLE_DETERMINANT_WFN_ERROR_RE.search(transcript)
+                ):
+                    raise RuntimeError(SINGLE_DETERMINANT_WFN_ERROR_TEXT)
                 raise RuntimeError(
                     f"Expected pattern not found before command {cmd!r}: {pattern!r}"
                 )
@@ -633,7 +679,7 @@ class _PexpectSession:
         Returns:
             True when waiting should stop.
         """
-        self._transcript.append(chunk)
+        self._append_transcript(chunk)
         if self._debug:
             print(f"[DEBUG] Read chunk while waiting: {chunk!r}")
         state.last_activity = time.monotonic()
@@ -1278,7 +1324,10 @@ class Multiwfn:
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            CommandStep("0", expect=r"(Fukui potential|0 Return)"),
+            CommandStep(
+                "0",
+                expect=r"(Fukui potential|0 Return)",
+            ),
             CommandStep("q", expect="gracefully"),
         ]
         result = self.run_commands(commands, subdir="fukui")
@@ -1299,6 +1348,8 @@ class Multiwfn:
 
         Raises:
             ValueError: If the system is open-shell or spin is undefined.
+            RuntimeError: If Multiwfn reports unsupported wavefunction type or no
+                superdelocalizability table can be parsed from output.
         """
         if self._has_spin is None:
             raise ValueError(
@@ -1320,14 +1371,31 @@ class Multiwfn:
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            CommandStep("0", expect="0 Return"),
-            CommandStep("q", expect="gracefully"),
+            # Prompt text after option 8 varies across Multiwfn builds; send "0"
+            # unconditionally to return to the previous menu.
+            CommandStep("0"),
+            # Do not gate quit on a specific prompt here; conceptual-DFT submenu
+            # prompts vary across Multiwfn builds.
+            CommandStep("q"),
         ]
         result = self.run_commands(commands, subdir="superdeloc")
         self._raise_if_single_determinant_wavefunction_error(
             result.stdout, analysis="Superdelocalizability analysis"
         )
         superdeloc_matrix = self._parse_superdelocalizabilities(result.stdout)
+        if not superdeloc_matrix["d_n"]:
+            nonempty_lines = [
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            ]
+            excerpt = "\n".join(nonempty_lines[-20:])
+            if excerpt:
+                excerpt = f"\nOutput excerpt:\n{excerpt}"
+            raise RuntimeError(
+                f"{SINGLE_DETERMINANT_WFN_ERROR_TEXT}. "
+                "Superdelocalizability analysis returned no atomic values; "
+                "Multiwfn output format may be unsupported."
+                f"{excerpt}"
+            )
 
         self._results.superdelocalizabilities = superdeloc_matrix
 
@@ -1695,9 +1763,9 @@ class Multiwfn:
         self, stdout: str, analysis: str
     ) -> None:
         """Raise a clear error for unsupported multi-determinant wavefunctions."""
-        if SINGLE_DETERMINANT_WFN_ERROR_PATTERN in stdout:
+        if SINGLE_DETERMINANT_WFN_ERROR_RE.search(stdout):
             raise RuntimeError(
-                f"{analysis} failed: {SINGLE_DETERMINANT_WFN_ERROR_PATTERN}."
+                f"{analysis} failed: {SINGLE_DETERMINANT_WFN_ERROR_TEXT}."
             )
 
     def _parse_fukui(self, stdout: str) -> dict[str, dict[int, float]]:
@@ -1711,13 +1779,62 @@ class Multiwfn:
     def _parse_superdelocalizabilities(
         self, stdout: str
     ) -> dict[str, dict[int, float]]:
-        """Parse superdelocalizability descriptors from stdout."""
-        return self._parse_atomic_table(
-            stdout,
-            header_keywords=["Atom", "D_N", "D_E"],
-            keys=["d_n", "d_e", "d_n_0", "d_e_0"],
-            stop_keyword="Sum of",
-        )
+        """Parse superdelocalizability descriptors from stdout.
+
+        Multiwfn output differs across versions/builds:
+        - Header labels may be `D_N`/`D_E` or `DN`/`DE`
+        - Rows may contain either 2 columns (D_N, D_E) or 4 columns
+          (D_N, D_E, D_N_0, D_E_0)
+
+        Args:
+            stdout: Multiwfn output text containing the superdelocalizability table.
+
+        Returns:
+            Mapping with keys `d_n`, `d_e`, `d_n_0`, and `d_e_0`, each containing
+            atom-indexed values when available.
+        """
+        result: dict[str, dict[int, float]] = {
+            "d_n": {},
+            "d_e": {},
+            "d_n_0": {},
+            "d_e_0": {},
+        }
+        lines = stdout.splitlines()
+
+        atom_header_re = re.compile(r"\bAtom(?:\s+index)?\b", flags=re.IGNORECASE)
+        dn_header_re = re.compile(r"\bD[_\s]?N\b", flags=re.IGNORECASE)
+        de_header_re = re.compile(r"\bD[_\s]?E\b", flags=re.IGNORECASE)
+        row_re = re.compile(r"\s*(\d+)\([A-Za-z][a-z]?\s*\)?\s+(.*)$")
+
+        for i, line in enumerate(lines):
+            if (
+                atom_header_re.search(line)
+                and dn_header_re.search(line)
+                and de_header_re.search(line)
+            ):
+                for data_line in lines[i + 1 :]:
+                    if not data_line.strip():
+                        break
+                    if "sum of" in data_line.lower():
+                        break
+
+                    row_match = row_re.match(data_line)
+                    if row_match is None:
+                        continue
+
+                    atom_idx = int(row_match.group(1))
+                    values = re.findall(NUMBER_PATTERN, row_match.group(2))
+                    if len(values) < 2:
+                        continue
+
+                    result["d_n"][atom_idx] = self._parse_float(values[0])
+                    result["d_e"][atom_idx] = self._parse_float(values[1])
+                    if len(values) >= 4:
+                        result["d_n_0"][atom_idx] = self._parse_float(values[2])
+                        result["d_e_0"][atom_idx] = self._parse_float(values[3])
+                break
+
+        return result
 
     def _parse_electric_moments(self, stdout: str) -> dict[str, float]:
         """Parse electric moments from stdout."""
