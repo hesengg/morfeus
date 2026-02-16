@@ -331,8 +331,8 @@ def test_generated_output_files(tmp_path, pentenone):
     elements, coordinates = pentenone
 
     xtb = XTB(elements, coordinates, run_path=tmp_path / "files")
-    molden_file = xtb.get_molden()
-    density_file = xtb.get_density()
+    molden_file = xtb.gen_molden_file()
+    density_file = xtb.gen_density_file()
     assert molden_file.exists()
     assert molden_file.name == XTB._xtb_molden_file
     assert molden_file.stat().st_size > 0
@@ -347,7 +347,7 @@ def test_generated_output_files(tmp_path, pentenone):
         n_unpaired=1,
         run_path=tmp_path / "spin",
     )
-    spin_density_file = xtb_spin.get_spin_density()
+    spin_density_file = xtb_spin.gen_spin_density_file()
     assert spin_density_file.exists()
     assert spin_density_file.name == XTB._xtb_spin_density_cube_file
     assert spin_density_file.stat().st_size > 0
@@ -359,4 +359,4 @@ def test_generated_output_files(tmp_path, pentenone):
         run_path=tmp_path / "closed-shell",
     )
     with pytest.raises(ValueError, match="requires unpaired electrons"):
-        xtb_closed_shell.get_spin_density()
+        xtb_closed_shell.gen_spin_density_file()
