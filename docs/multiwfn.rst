@@ -1,23 +1,27 @@
-==================
-Multiwfn Interface
-==================
+========
+Multiwfn
+========
 
 Morfeus provides an interface to the `Multiwfn program`_ for wavefunction analysis as described by Tian Lu :footcite:`lu_2024` :footcite:`lu_chen_2012`.
 
-Multiwfn itself must be installed separately and available as ``Multiwfn`` in
+Multiwfn itself must be installed separately and be available as ``Multiwfn`` in
 your shell environment. Refer to the `Multiwfn manual`_ for installation instructions.
 
 The optional dependency ``pexpect`` is required to run any function in this module.
 
-Caution: This module has only been tested with molden files derived from xTB, PySCF and ORCA.
-The `molden2aim`_ utility is recommended to standardize wavefunction files.
+.. warning::
+
+    This module has only been tested with molden files derived from xTB, PySCF and ORCA.
+    The `molden2aim`_ utility is recommended to standardize wavefunction files.
+
+.. __:
 
 ******
 Module
 ******
 
 The :py:class:`Multiwfn <morfeus.multiwfn.Multiwfn>` class allows calculation
-of a variety of descriptors and properties from wavefunction (molden/wfn)
+of a variety of descriptors and properties from wavefunction (``.molden``/``.wfn``)
 files.
 Additionally, grid files (``.cub`` or ``.grd``) can be generated or integrated.
 
@@ -37,7 +41,7 @@ Citations used by the selected analyses can be collected directly:
 
 
 #######################
-Charges and Bond Orders
+Charges and bond orders
 #######################
 
 .. code-block:: python
@@ -80,7 +84,7 @@ Grid files
 ##########
 
 Grid files can be generated for all descriptors with ``get_grid()``
-(grid quality significantly affects the computational cost and accuracy).
+(the grid quality significantly affects the computational cost and accuracy).
 Cube files can directly be integrated per atom with ``grid_to_descriptors()``.
 
 .. code-block:: python
