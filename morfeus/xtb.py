@@ -11,7 +11,6 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import tempfile
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 
@@ -93,12 +92,6 @@ class XTB:
         self._electronic_temperature = electronic_temperature
         self._n_processes = n_processes
         self._env_variables = env_variables
-
-        self._run_path = (
-            Path(run_path)
-            if run_path
-            else Path(tempfile.mkdtemp(prefix="morfeus_xtb_"))
-        )
 
         self._default_xtb_command = (
             f"xtb {XTB._xyz_input_file} --json --chrg {self._charge}"
