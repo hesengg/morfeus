@@ -68,7 +68,7 @@ Features
 * Exact ligand cone angle
 * Ligand solid angle
 * Local force constant
-* Multiwfn interface
+* Multiwfn electronic descriptors
 * Pyramidalization
 * Solvent accessible surface area
 * Sterimol parameters
