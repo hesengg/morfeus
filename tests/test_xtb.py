@@ -69,6 +69,31 @@ def test_make_xtb_inp_spin_density_writes_expected_flags(tmp_path):
     assert "spin density=true" in spin_input
 
 
+@pytest.mark.parametrize(
+    ("method_name", "runtype", "filename"),
+    [
+        ("gen_molden_file", "molden", XTB._xtb_molden_file),
+        ("gen_density_file", "density", XTB._xtb_density_cube_file),
+        ("gen_spin_density_file", "spin density", XTB._xtb_spin_density_cube_file),
+    ],
+)
+def test_file_generation_helpers_dispatch_to_xtb(
+    tmp_path, monkeypatch, method_name, runtype, filename
+):
+    """Test file-generation helper names and runtype dispatch."""
+    xtb = XTB(["H"], [[0.0, 0.0, 0.0]], run_path=tmp_path)
+    called_runtypes = []
+
+    def fake_run_xtb(requested_runtype):
+        called_runtypes.append(requested_runtype)
+
+    monkeypatch.setattr(xtb, "_run_xtb", fake_run_xtb)
+
+    output_file = getattr(xtb, method_name)()
+    assert output_file == tmp_path / filename
+    assert called_runtypes == [runtype]
+
+
 @pytest.mark.xtb
 def test_fukui():
     """Test Fukui coefficients."""

@@ -59,6 +59,7 @@ class XTB:
     _method: int | str
     _n_processes: int | None
     _env_variables: dict[str, str] | None
+    _run_path: Path | None
     _iterations: int | None = None
 
     _xyz_input_file: str = "xtb.xyz"
@@ -92,7 +93,7 @@ class XTB:
         self._electronic_temperature = electronic_temperature
         self._n_processes = n_processes
         self._env_variables = env_variables
-        self._run_path = run_path
+        self._run_path = Path(run_path) if run_path is not None else None
 
         self._default_xtb_command = (
             f"xtb {XTB._xyz_input_file} --json --chrg {self._charge}"
@@ -848,16 +849,24 @@ class XTB:
 
     def get_molden(self) -> Path:
         """Generate molden file for the molecule."""
+        if self._run_path is None:
+            raise ValueError("Molden file generation requires 'run_path' to be set.")
         self._run_xtb("molden")
         return self._run_path / XTB._xtb_molden_file
 
     def get_density(self) -> Path:
         """Generate electron density cube file for the molecule."""
+        if self._run_path is None:
+            raise ValueError("Density file generation requires 'run_path' to be set.")
         self._run_xtb("density")
         return self._run_path / XTB._xtb_density_cube_file
 
     def get_spin_density(self) -> Path:
         """Generate spin density cube file for the molecule."""
+        if self._run_path is None:
+            raise ValueError(
+                "Spin-density file generation requires 'run_path' to be set."
+            )
         self._run_xtb("spin density")
         return self._run_path / XTB._xtb_spin_density_cube_file
 
@@ -1000,16 +1009,28 @@ class XTB:
             elif runtype == "fod":
                 self._parse_fod(run_folder / "fod")
             elif runtype == "molden":
+                if self._run_path is None:
+                    raise RuntimeError(
+                        "Internal error: missing run_path for molden file output."
+                    )
                 shutil.copy(
                     run_folder / "molden.input",
                     self._run_path / XTB._xtb_molden_file,
                 )
             elif runtype == "density":
+                if self._run_path is None:
+                    raise RuntimeError(
+                        "Internal error: missing run_path for density file output."
+                    )
                 shutil.copy(
                     run_folder / XTB._xtb_density_cube_file,
                     self._run_path / XTB._xtb_density_cube_file,
                 )
             elif runtype == "spin density":
+                if self._run_path is None:
+                    raise RuntimeError(
+                        "Internal error: missing run_path for spin-density file output."
+                    )
                 shutil.copy(
                     run_folder / XTB._xtb_spin_density_cube_file,
                     self._run_path / XTB._xtb_spin_density_cube_file,
