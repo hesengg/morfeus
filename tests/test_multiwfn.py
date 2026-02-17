@@ -26,10 +26,10 @@ EXAMPLE_MOLDEN_DIR = DATA_DIR / "example_molden"
 EXAMPLE_WFN_DIR = DATA_DIR / "example_wfn"
 DEFAULT_MOLDEN_FILE = EXAMPLE_MOLDEN_DIR / "xtb_singlet.molden"
 DEFAULT_WFN_FILE = EXAMPLE_WFN_DIR / "pyscf_casscf_triplet_rohf_natorb.wfn"
-FAST_DESCRIPTOR_SMOKE_MODELS = ("ESP_nuclear", "deltag_pro", "RDG_pro")
+FAST_DESCRIPTOR_SMOKE_MODELS = ("esp_nuclear", "deltag_pro", "rdg_pro")
 CHARGE_SMOKE_MODELS = ("adch", "hirshfeld")
 BOND_ORDER_SMOKE_MODELS = ("mayer", "wiberg")
-SURFACE_SMOKE_MODEL = "ALIE"
+SURFACE_SMOKE_MODEL = "alie"
 WFN_NO_BASIS_FUNCTION_INFORMATION_ERROR = (
     "The input file you used does not contain basis function information!"
 )
