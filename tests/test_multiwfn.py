@@ -1303,7 +1303,6 @@ class TestMultiwfnRunStubs:
         assert "window_start" not in gap_open["gaps"]
         assert "window_end" not in gap_open["gaps"]
         assert "occupation_thresholds" not in gap_open["gaps"]
-        assert mwfn.get_gap() is gap_open
 
         with pytest.raises(ValueError, match="Upper occupation threshold"):
             mwfn.get_gaps(occupation_thresholds=(1.5, 1.5))

@@ -1619,14 +1619,6 @@ class Multiwfn:
         cached[cache_key] = gap_result
         return gap_result
 
-    def get_gap(
-        self,
-        n: int = 3,
-        occupation_thresholds: tuple[float, float] = (0.5, 1.5),
-    ) -> dict[str, Any]:
-        """Backward-compatible alias for :meth:`get_gaps`."""
-        return self.get_gaps(n=n, occupation_thresholds=occupation_thresholds)
-
     def _get_homo_lumo(self) -> dict[str, float | int]:
         """Calculate eV-based HOMO/LUMO energies and HOMO-LUMO gap."""
         commands = [
