@@ -71,19 +71,19 @@ REAL_SPACE_FUNCTIONS: dict[str, str] = {
     "rho_grad_norm": "2 Gradient norm of rho",
     "rho_lapl": "3 Laplacian of rho",
     "spin_density": "5 Electron spin density",
-    "Kr": "6 Hamiltonian kinetic energy density",
-    "Gr": "7 Lagrangian kinetic energy density",
-    "ESP_nuclear": "8 Electrostatic potential from nuclear charges",
-    "ELF": "9 Electron localization function",
-    "LOL": "10 Localized orbital locator",
-    "LIE": "11 Local information entropy",
-    "ESP_total": "12 Total electrostatic potential",
-    "RDG": "13 Reduced density gradient",  # only for grid
-    "RDG_pro": "14 RDG with promolecular approximation",
+    "kr": "6 Hamiltonian kinetic energy density",
+    "gr": "7 Lagrangian kinetic energy density",
+    "esp_nuclear": "8 Electrostatic potential from nuclear charges",
+    "elf": "9 Electron localization function",
+    "lol": "10 Localized orbital locator",
+    "lie": "11 Local information entropy",
+    "esp_total": "12 Total electrostatic potential",
+    "rdg": "13 Reduced density gradient",  # only for grid
+    "rdg_pro": "14 RDG with promolecular approximation",
     "sign": "15 Sign",
     "sign_pro": "16 Sign",
     "correlation_alpha": "17 Correlation hole for alpha",
-    "ALIE": "18 Average local ionization energy",
+    "alie": "18 Average local ionization energy",
     "deltag_pro": "22 Delta-g",
     "deltag_hirsh": "23 Delta-g",
     "iri": "24 Interaction region indicator",
@@ -219,7 +219,7 @@ REAL_FUNCTIONS_EXPENSIVE: set[str] = {
     "negative_part_of_ESP",
     "magnitude_electric_field",
     "steric_charge",
-    "ESP_total",
+    "esp_total",
 }
 
 ALL_FUNCTIONS: set[str] = (
@@ -1081,6 +1081,8 @@ class Multiwfn:
             "on improved Marching Tetrahedra algorithm, J. Mol. Graph. Model., 38, "
             "314-323 (2012)"
         )
+        if normalized_model == "esp":
+            self._results.citations.add("Phys. Chem. Chem. Phys., 23, 20323 (2021)")
 
         commands = [
             CommandStep("12", expect="12 Quantitative analysis of molecular surface"),
