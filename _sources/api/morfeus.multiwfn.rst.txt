@@ -1,0 +1,6 @@
+morfeus.multiwfn module
+=======================
+
+.. automodule:: morfeus.multiwfn
+   :members:
+   :show-inheritance:
