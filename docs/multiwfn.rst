@@ -35,29 +35,38 @@ Citations used by the selected analyses can be collected directly:
 .. code-block:: python
   :caption: Example
 
-  >>> mwfn = Multiwfn("molden.input", run_path="mwfn_run", has_spin=False)
+  >>> from morfeus import Multiwfn
+  >>> mwfn = Multiwfn("molden.input")
   >>> mwfn.get_charges("hirshfeld")
   >>> mwfn.get_citations()
+
+All available options can be accessesed with the ``list_options()`` method:
+
+.. code-block:: python
+  :caption: Example
+
+  >>> options = mwfn.list_options()
+  >>> options.keys()
+  ['bond_order', 'charges', 'descriptors', 'descriptors_fast', 'grid_quality', 'surface']
 
 
 #######################
 Charges and bond orders
 #######################
 
+Several charge and bond order models are available and can be calculated as:
+
 .. code-block:: python
   :caption: Example
-
-  >>> from morfeus import Multiwfn
-  >>> mwfn = Multiwfn("molden.input", run_path="mwfn_run")
-  >>> options = mwfn.list_options()
-  >>> sorted(options.keys())
-  ['bond_order', 'charges', 'descriptors', 'descriptors_fast', 'grid_quality', 'surface']
-
+  
+  >>> mwfn = Multiwfn("molden.input")
   >>> charges = mwfn.get_charges(model="adch")
-  >>> surface = mwfn.get_surface(model="esp")
   >>> bond_orders = mwfn.get_bond_order(model="mayer")
-  >>> sorted(surface.keys())
-  ['atomic', 'global']
+  >>> charges[1]
+  0.123
+  >>> bond_orders[(1, 2)]
+  0.456
+
 
 #######################
 Fuzzy-space descriptors
@@ -73,11 +82,50 @@ The descriptors can be calculated with:
 .. code-block:: python
   :caption: Example
 
-  >>> mwfn = Multiwfn("molden.input", run_path="mwfn_run")
+  >>> mwfn = Multiwfn("molden.input")
   >>> rho = mwfn.get_descriptor("rho")
 
 Caution: Some functions may not be available or meaningful for some
 wavefunction types or spin states.
+
+###################
+Surface descriptors
+###################
+
+Several global and atomic descriptors can be derived from the quantitative
+analysis of molecular surfaces. The available surfaces can be listed with
+``mwfn.list_options()["surface"]``. 
+The atomic descriptors are only provided for atoms with significant contributions.
+For example, the electrostatic potential (ESP) can be analyzed with as below:
+
+.. code-block:: python
+  :caption: Example
+  
+  >>> mwfn = Multiwfn("molden.input")
+  >>> esp_surface = mwfn.get_surface("esp")
+  >>> esp_surface.keys()
+  dict_keys(['atomic', 'global'])
+  >>> esp_surface["global"].get("minimal_value")
+  -58.90822
+  >>> atom_3 = esp_surface["atomic"][3]
+  >>> atom_3.get("area_positive"), atom_3.get("area_negative")
+  (8.82908, -2.14958)
+
+
+#######################
+Conceptual DFT analyses
+#######################
+
+These analyses require a closed-shell wavefunction, so set ``has_spin=False``
+or let spin be auto-detected for a closed-shell input.
+
+.. code-block:: python
+  :caption: Example
+
+  >>> mwfn = Multiwfn("molden.input", run_path="mwfn_run", has_spin=False)
+  >>> fukui = mwfn.get_fukui()
+  >>> superdeloc = mwfn.get_superdelocalizabilities()
+
 
 ##########
 Grid files
@@ -96,19 +144,28 @@ Cube files can directly be integrated per atom with ``grid_to_descriptors()``.
   'rho.cub'
   >>> integrated = mwfn.grid_to_descriptors(cube_path)
 
+
 #######################
-Conceptual DFT analyses
+Electrostatic potential
 #######################
 
-These analyses require a closed-shell wavefunction, so set ``has_spin=False``
-or let spin be auto-detected for a closed-shell input.
+One commonly used descriptor is the electrostatic potential (ESP).
+The molecular ESP at position :math:`\mathbf{r}` is defined as
 
-.. code-block:: python
-  :caption: Example
+.. math::
 
-  >>> mwfn = Multiwfn("molden.input", run_path="mwfn_run", has_spin=False)
-  >>> fukui = mwfn.get_fukui()
-  >>> superdeloc = mwfn.get_superdelocalizabilities()
+  V(\mathbf{r}) = \sum_A \frac{Z_A}{|\mathbf{R}_A - \mathbf{r}|}
+  - \int \frac{\rho(\mathbf{r}')}{|\mathbf{r} - \mathbf{r}'|} d\mathbf{r}'
+
+where :math:`Z_A` and :math:`\mathbf{R}_A` are nuclear charges/positions and
+:math:`\rho(\mathbf{r}')` is the electron density. 
+Mapping :math:`V(\mathbf{r})` onto a molecular surface is commonly used to 
+identify electron-rich (:math:`V < 0`) and electron-poor (:math:`V > 0`) regions.
+:footcite:`murray_politzer_2011`
+
+In this module, ``get_surface("esp")`` provides global and atom-resolved
+surface statistics, while ``get_descriptor("esp_total")`` and related
+ESP-derived functions provide fuzzy-space atomic integrals.
 
 
 **********
