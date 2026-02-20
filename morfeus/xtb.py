@@ -914,6 +914,8 @@ class XTB:
                 "and HOMO/LUMO energies.\n"
                 "For other descriptors, choose another xtb method."
             )
+        elif runtype == "sp":
+            pass
         elif runtype == "ipea":
             arguments_xtb_command = " --vipea"
         elif runtype == "fukui":
@@ -958,6 +960,9 @@ class XTB:
             if use_xtb_input:
                 arguments_xtb_command += f" --input {XTB._xtb_input_file}"
 
+            command = self._default_xtb_command + arguments_xtb_command
+            if use_xtb_input:
+                command += f" --input {XTB._xtb_input_file}"
             # Run xtb
             command = self._default_xtb_command + arguments_xtb_command
             with open(run_folder / "xtb.out", "w") as stdout, open(
@@ -975,6 +980,7 @@ class XTB:
             # Return error if xtb fails
             with open(run_folder / "xtb.err", "r", encoding="utf8") as f:
                 err_content = f.read()
+
             if not re.search(r"(?<!ab)normal termination of xtb", err_content):
                 with open(run_folder / "xtb.out", "r", encoding="utf8") as f:
                     out_content = f.read()
