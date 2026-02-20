@@ -7,7 +7,13 @@ Morfeus provides an interface to the `Multiwfn program`_ for wavefunction analys
 Multiwfn itself must be installed separately and be available as ``Multiwfn`` in
 your shell environment. Refer to the `Multiwfn manual`_ for installation instructions.
 
-The optional dependency ``pexpect`` is required to run any function in this module.
+The package `Pexpect`_ is also required to run any function in this module.
+
+Morfeus controls Multiwfn's interactive menu system with scripted command
+sequences. Results are parsed into Python dictionaries indexed by atom number
+(1-based indexing) or descriptor names.
+
+For Multiwfn menu-level details, see the `Multiwfn manual`_.
 
 .. warning::
 
@@ -96,7 +102,7 @@ Several global and atomic descriptors can be derived from the quantitative
 analysis of molecular surfaces. The available surfaces can be listed with
 ``mwfn.list_options()["surface"]``. 
 The atomic descriptors are only provided for atoms with significant contributions.
-For example, the electrostatic potential (ESP) can be analyzed with as below:
+For example, the electrostatic potential (ESP) can be calculated with:
 
 .. code-block:: python
   :caption: Example
@@ -145,6 +151,10 @@ Cube files can directly be integrated per atom with ``grid_to_descriptors()``.
   >>> integrated = mwfn.grid_to_descriptors(cube_path)
 
 
+**********
+Background
+**********
+
 #######################
 Electrostatic potential
 #######################
@@ -167,19 +177,9 @@ In this module, ``get_surface("esp")`` provides global and atom-resolved
 surface statistics, while ``get_descriptor("esp_total")`` and related
 ESP-derived functions provide fuzzy-space atomic integrals.
 
-
-**********
-Background
-**********
-
-Morfeus controls Multiwfn's interactive menu system with scripted command
-sequences. Results are parsed into Python dictionaries indexed by atom number
-(1-based indexing) or descriptor names.
-
-For Multiwfn setup and menu-level details, see the `Multiwfn manual`_.
-
 .. footbibliography::
 
 .. _Multiwfn program: http://sobereva.com/multiwfn/
 .. _Multiwfn manual: http://sobereva.com/multiwfn/Multiwfn_manual.html
+.. _Pexpect: https://pexpect.readthedocs.io/en/stable/
 .. _molden2aim: https://github.com/zorkzou/Molden2AIM
