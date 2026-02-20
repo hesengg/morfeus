@@ -72,6 +72,7 @@ def build_execution_env(
     env["MKL_NUM_THREADS"] = f"{num_threads}"
     env["OMP_STACKSIZE"] = str(config_stacksize)
     env["OMP_MAX_ACTIVE_LEVELS"] = str(int(config_max_active_levels))
+
     return env
 
 

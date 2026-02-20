@@ -716,7 +716,7 @@ class XTB:
             NFOD descriptor
         """
         fod_pop = self.get_fod_population()
-        nfod = sum(fod_pop.values())
+        nfod = float(f"{sum(fod_pop.values()):.3g}")
 
         return nfod
 
@@ -871,17 +871,15 @@ class XTB:
         return self._run_path / XTB._xtb_spin_density_cube_file
 
     def _make_xtb_inp(self, run_folder: Path, runtype: str) -> bool:
-        """Create an xTB input file and return whether it should be used."""
+        """Create an xTB input file if necessary and return whether it should be used."""
         xtb_inp = run_folder / XTB._xtb_input_file
         inputs = {}
         if self._solvent is not None:
             inputs["write"] = ["gbsa=true"]
-
         if runtype == "density":
             inputs["write"] = inputs.get("write", []) + ["density=true"]
         elif runtype == "spin density":
             inputs["write"] = inputs.get("write", []) + ["spin density=true"]
-
         if len(inputs) > 0:
             write_xtb_inp(xtb_inp, inputs)
         return inputs != {}
@@ -907,16 +905,15 @@ class XTB:
         """
         # Set xtb command
         arguments_xtb_command = ""
-
         runtypes = ["sp", "ipea", "fukui", "fod", "molden", "density", "spin density"]
-        if runtype != "sp" and self._method == "ptb":
+        if runtype == "sp":
+            pass
+        elif self._method == "ptb":
             raise ValueError(
                 "PTB can only be used for calculations of bond orders, charges, dipole, "
                 "and HOMO/LUMO energies.\n"
                 "For other descriptors, choose another xtb method."
             )
-        elif runtype == "sp":
-            pass
         elif runtype == "ipea":
             arguments_xtb_command = " --vipea"
         elif runtype == "fukui":
@@ -956,12 +953,13 @@ class XTB:
             xyz_file = run_folder / XTB._xyz_input_file
             write_xyz(xyz_file, self._elements, self._coordinates)
 
+            # Write xTB input file if necessary
             use_xtb_input = self._make_xtb_inp(run_folder, runtype)
-
-            command = self._default_xtb_command + arguments_xtb_command
             if use_xtb_input:
-                command += f" --input {XTB._xtb_input_file}"
+                arguments_xtb_command += f" --input {XTB._xtb_input_file}"
+
             # Run xtb
+            command = self._default_xtb_command + arguments_xtb_command
             with open(run_folder / "xtb.out", "w") as stdout, open(
                 run_folder / "xtb.err", "w"
             ) as stderr:
@@ -977,7 +975,6 @@ class XTB:
             # Return error if xtb fails
             with open(run_folder / "xtb.err", "r", encoding="utf8") as f:
                 err_content = f.read()
-
             if not re.search(r"(?<!ab)normal termination of xtb", err_content):
                 with open(run_folder / "xtb.out", "r", encoding="utf8") as f:
                     out_content = f.read()
@@ -1030,10 +1027,11 @@ class XTB:
 
     def _set_env(self) -> dict[str, str]:
         """Set environment variables for xTB execution."""
-        return build_execution_env(
+        env = build_execution_env(
             env_variables=self._env_variables,
             n_processes=self._n_processes,
         )
+        return env
 
     def _parse_json(self, json_file: Path | str) -> None:
         """Parse 'xtbout.json' file."""
