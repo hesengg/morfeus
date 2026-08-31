@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     TODO: once conda-forge ships a rebuilt xtb which fixes the issue, remove the patch added in PR #89.
 
 ### Fixed
+- Internal cone angle algorithm no longer raises `math domain error` on numerically degenerate tangency roots; unphysical candidate cones are discarded and the search completes
 - Compatibility issue with Python 3.14 where command-line interface failed due to `fire` library's requirement for `__name__` attribute on `functools.partial` objects
 - Update type annotations which were throwing errors with newer versions of mypy
 
