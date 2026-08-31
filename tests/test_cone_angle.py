@@ -43,3 +43,22 @@ def test_reference(cone_angle_data):
         elements, coordinates = read_xyz(xyz_path)
         ca = ConeAngle(elements, coordinates, 1, radii_type="bondi")
         assert_almost_equal(ca.cone_angle, cone_angle_ref, decimal=1)
+
+
+@pytest.mark.benchmark
+def test_reference_internal(cone_angle_data):
+    """Test the internal algorithm against cone angle reference data.
+
+    The default method's tests only cover the internal algorithm when
+    libconeangle is not installed, so it is exercised explicitly here.
+    """
+    for metal in ("pd", "pt", "ni"):
+        label, data = cone_angle_data
+        cone_angle_ref = float(data[f"{metal}_cone_angle"])
+        if label == "standard":
+            xyz_path = DATA_DIR / f"{metal}/{data[f'{metal}_xyz']}.xyz"
+        elif label == "maximum":
+            xyz_path = DATA_DIR / f"{metal}/maximum/{data[f'{metal}_xyz']}.xyz"
+        elements, coordinates = read_xyz(xyz_path)
+        ca = ConeAngle(elements, coordinates, 1, radii_type="bondi", method="internal")
+        assert_almost_equal(ca.cone_angle, cone_angle_ref, decimal=1)

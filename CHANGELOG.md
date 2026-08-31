@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-08-06
 
+### Changed
+- Vectorized the internal cone angle algorithm's search over atom triples, ~100x faster on large ligands with unchanged results
+
 ### Added
 - GitHub Actions job that runs xtb-marked tests on every PR (including xtb binary installation)
 - New test comparing `XTB.get_charges` output against reference xtb values
