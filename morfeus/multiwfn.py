@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import functools
+import json
 import math
+from numbers import Integral
 from pathlib import Path
 import re
 import shutil
@@ -284,20 +286,14 @@ class CommandStep:
     Args:
         cmd: Command to send
         expect: Pattern to expect before sending
-        optional: If True, only execute if expect pattern is found in output;
-                  if False, always execute regardless
+        optional: Skip the command if the expected prompt is absent
+        max_wait: Inactivity timeout for a calculation, also in non-robust mode
     """
 
     cmd: str | None = None
     expect: str | None = None
     optional: bool = False
-
-
-@dataclass
-class WaitProgress:
-    """Wait for a progress bar to complete."""
-
-    max_wait: float = 30.0
+    max_wait: float | None = None
 
 
 @dataclass
@@ -368,33 +364,6 @@ class _PexpectSession:
         except (pexpect.TIMEOUT, pexpect.EOF):
             pass
 
-    def wait_for_progress(self, max_wait: float = 30.0) -> None:
-        """Read progress output until completion, EOF, or the idle timeout."""
-        last_activity = time.monotonic()
-        saw_progress = False
-        while True:
-            try:
-                chunk = self._child.read_nonblocking(size=8192, timeout=0.5)
-            except pexpect.EOF:
-                return
-            except pexpect.TIMEOUT:
-                timeout = max_wait if saw_progress else min(1.0, max_wait)
-                if time.monotonic() - last_activity >= timeout:
-                    return
-                continue
-            if not chunk:
-                continue
-            self._append_transcript(chunk)
-            last_activity = time.monotonic()
-            has_progress, percentage = self._has_progress_bar(chunk)
-            if self._debug:
-                print(f"[DEBUG] Progress output: {chunk!r}")
-            if (percentage is not None and percentage >= 100) or (
-                saw_progress and not has_progress
-            ):
-                return
-            saw_progress = saw_progress or has_progress
-
     def send(self, cmd: str) -> None:
         """Send command to process.
 
@@ -406,49 +375,28 @@ class _PexpectSession:
             print(f"[DEBUG] Sent: {cmd!r}")
         self._last_command_pos = len(self._transcript)
 
-    def _has_progress_bar(self, text: str) -> tuple[bool, float | None]:
-        """Check if text contains a progress bar and extract percentage.
-
-        Args:
-            text: Text chunk to inspect.
-
-        Returns:
-            Tuple of (has_progress_bar, percentage).
-        """
-        bar_match = re.search(r"\[([#=\-]+)\]", text)
-        if bar_match:
-            bar = bar_match.group(1)
-            if "-" not in bar:
-                return True, 100.0
-        # Match patterns like: "Progress: [###---] 14.3 %" or "14.3 %"
-        progress_pattern = r"Progress:\s*\[[#-]+\]\s+([\d.]+)\s*%"
-        match = re.search(progress_pattern, text)
-        if match:
-            try:
-                percentage = float(match.group(1))
-                return True, percentage
-            except ValueError:
-                return True, None
-        return False, None
-
-    def expect(self, pattern: str, timeout: float | None = None) -> bool:
+    def expect(
+        self, pattern: str, timeout: float | None = None, *, idle: bool = False
+    ) -> bool:
         """Wait for a pattern, returning False on timeout or process exit."""
         if self._debug:
             print(f"[DEBUG] Expecting: {pattern!r}")
-        try:
-            self._child.expect(
-                pattern, timeout=self._expect_timeout if timeout is None else timeout
-            )
-            self._append_transcript(self._child.before)
-            self._append_transcript(self._child.after)
-            return True
-        except pexpect.TIMEOUT:
-            self.read_available()
-        except pexpect.EOF:
-            self._append_transcript(self._child.before)
-        if self._debug:
-            print(f"[DEBUG] Pattern not found: {pattern!r}")
-        return False
+        timeout = self._expect_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+        while not re.search(pattern, self.get_output_since_last_command()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                chunk = self._child.read_nonblocking(size=8192, timeout=remaining)
+            except (pexpect.TIMEOUT, pexpect.EOF):
+                return False
+            self._append_transcript(chunk)
+            if self._debug:
+                print(f"[DEBUG] Output: {chunk!r}")
+            if idle and chunk:
+                deadline = time.monotonic() + timeout
+        return True
 
     def load(self, file_path: Path, reset: bool = False) -> None:
         """Load an input after optionally resetting an existing process."""
@@ -464,9 +412,7 @@ class _PexpectSession:
     def wait_for_main_menu(self) -> None:
         """Require the complete main menu before reusing the process."""
         pattern = "300 Other functions"
-        if not self._has_pattern_in_buffered_output(pattern) and not self.expect(
-            pattern
-        ):
+        if not self.expect(pattern):
             raise RuntimeError("Multiwfn did not return to the main menu.")
 
     def close(self, graceful: bool = False) -> None:
@@ -498,22 +444,18 @@ class _PexpectSession:
         """Full session transcript."""
         return "".join(self._transcript)
 
-    def _has_pattern_in_buffered_output(self, pattern: str) -> bool:
-        """Check output since the last command for an already consumed prompt."""
-        return re.search(pattern, self.get_output_since_last_command()) is not None
-
-    def _process_command(
-        self, item: str | CommandStep | WaitProgress, use_robust: bool
-    ) -> None:
+    def _process_command(self, item: str | CommandStep, use_robust: bool) -> None:
         """Send a command after checking its required or optional prompt."""
-        if isinstance(item, WaitProgress):
-            self.wait_for_progress(max_wait=item.max_wait)
-            return
         if isinstance(item, str):
             item = CommandStep(item)
-        if item.expect and (item.optional or (use_robust and item.cmd is not None)):
-            matched = self._has_pattern_in_buffered_output(item.expect) or self.expect(
-                item.expect, timeout=1.0 if item.optional else None
+        if item.expect and (item.optional or use_robust or item.max_wait is not None):
+            timeout = item.max_wait
+            if timeout is None and item.optional:
+                timeout = 1.0
+            matched = self.expect(
+                item.expect,
+                timeout=timeout,
+                idle=item.max_wait is not None,
             )
             if not matched:
                 if item.optional:
@@ -542,7 +484,8 @@ class Multiwfn:
             If False, send commands without waiting (faster but may desync).
         debug: If True, print debug info including sent commands and expect patterns.
         env_variables: Environment variables to use for the Multiwfn process.
-        max_wait: Maximum time to wait for progress updates in seconds.
+        max_wait: Maximum inactivity while waiting for calculation completion,
+            in seconds. Calculation waits also apply in non-robust mode.
         has_spin: Spin state. If None, detect from file for wavefunction inputs
             (True=open-shell, False=closed-shell). For .cub/.grd inputs, spin
             state is left undefined.
@@ -606,17 +549,22 @@ class Multiwfn:
             self._has_spin = self._detect_spin_state()
 
     def _detect_spin_state(self) -> bool:
-        """Load the molden file and parse the multiplicity."""
+        """Read multiplicity or spin-resolved electron counts from the input."""
         result = self._run_commands([])
         mult_pattern = r"Expected multiplicity:\s*(\d+)"
 
         match = re.search(mult_pattern, result.stdout)
-        if not match:
-            self._close_session()
-            raise RuntimeError("Could not detect multiplicity from the file.")
-
-        mult = int(match.group(1))
-        return mult > 1
+        if match:
+            return int(match.group(1)) > 1
+        counts = re.search(
+            rf"Total/Alpha/Beta electrons:\s*{NUMBER_PATTERN}\s*"
+            rf"({NUMBER_PATTERN})\s*({NUMBER_PATTERN})",
+            result.stdout,
+        )
+        if counts:
+            return not math.isclose(float(counts[1]), float(counts[2]), abs_tol=1e-6)
+        self._close_session()
+        raise RuntimeError("Could not detect multiplicity from the file.")
 
     def load_settingini(self, file_path: str | Path) -> None:
         """Load custom settings.ini file for all future runs.
@@ -748,16 +696,15 @@ class Multiwfn:
         menu_pattern: str,
         prefix_commands: list[CommandStep] | None = None,
         partitioning: str = "becke",
-    ) -> list[CommandStep | WaitProgress]:
+    ) -> list[CommandStep]:
         """Build command sequence for fuzzy atomic space integration."""
-        commands: list[CommandStep | WaitProgress] = list(prefix_commands or [])
+        commands: list[CommandStep] = list(prefix_commands or [])
         commands.extend(
             [
                 *self._commands_fuzzy_partitioning(partitioning),
                 CommandStep("1", expect="1 Perform integration in fuzzy atomic spaces"),
                 CommandStep(menu_cmd, expect=menu_pattern),
-                WaitProgress(self._max_wait),
-                CommandStep("0", expect="0 Return"),
+                CommandStep("0", expect="0 Return", max_wait=self._max_wait),
             ]
         )
         return commands
@@ -787,6 +734,7 @@ class Multiwfn:
             "surface": sorted(SURFACE_MODELS),
             "bond_order": sorted(BOND_ORDER_MODELS),
             "grid_quality": sorted(GRID_QUALITIES),
+            "interaction": ["igmh", "nci"],
             "descriptors": sorted(ALL_FUNCTIONS),
             "descriptors_fast": sorted(FAST_FUNCTIONS),
         }
@@ -797,7 +745,7 @@ class Multiwfn:
 
     def run_commands(
         self,
-        commands: Iterable[str | CommandStep | WaitProgress],
+        commands: Iterable[str | CommandStep],
         subdir: str | None = None,
     ) -> MultiwfnRunResult:
         """Run custom commands that return to the main menu.
@@ -828,7 +776,7 @@ class Multiwfn:
     @requires_executable(["Multiwfn"])
     def _run_commands(
         self,
-        commands: Iterable[str | CommandStep | WaitProgress],
+        commands: Iterable[str | CommandStep],
         subdir: str | None = None,
     ) -> MultiwfnRunResult:
         """Run a descriptor from main menu to main menu, managing process lifetime."""
@@ -932,8 +880,7 @@ class Multiwfn:
                     else " 1 Output Mulliken population and atomic"
                 ),
             ),
-            WaitProgress(self._max_wait),
-            CommandStep("y", expect="y/n"),
+            CommandStep("y", expect="y/n", max_wait=self._max_wait),
         ]
         if normalized_model == "mulliken":
             commands += [CommandStep("0", expect="Mulliken population")]
@@ -1006,8 +953,9 @@ class Multiwfn:
             CommandStep("2", expect="2 Select mapped function"),
             CommandStep(menu_cmd, expect=menu_pattern),
             CommandStep("0", expect="0 Start analysis"),
-            WaitProgress(self._max_wait),
-            CommandStep("11", expect="11 Output surface properties"),
+            CommandStep(
+                "11", expect="11 Output surface properties", max_wait=self._max_wait
+            ),
             CommandStep("n", expect="surface facets to locsurf"),
             CommandStep("-1", expect="-1 Return to upper[- ]level"),
             CommandStep("-1", expect="-1 Return to main menu"),
@@ -1062,8 +1010,7 @@ class Multiwfn:
         commands = [
             CommandStep("9", expect="9 Bond order analysis"),
             CommandStep(menu_cmd, expect=menu_pattern),
-            WaitProgress(self._max_wait),
-            CommandStep("n", expect="current folder"),
+            CommandStep("n", expect="current folder", max_wait=self._max_wait),
             CommandStep("0", expect="0 Return"),
         ]
 
@@ -1182,7 +1129,7 @@ class Multiwfn:
                 f"Grid quality {grid_quality!r} not supported. Choose between {choices}."
             )
 
-        grid_commands: list[CommandStep | WaitProgress] = [
+        grid_commands: list[CommandStep] = [
             *commands,
             CommandStep(
                 "5",
@@ -1190,8 +1137,11 @@ class Multiwfn:
             ),
             CommandStep(menu_cmd, expect=menu_pattern),
             *grid_quality_commands,
-            WaitProgress(self._max_wait),
-            CommandStep("2", expect="2 Export data to a Gaussian-type cube file"),
+            CommandStep(
+                "2",
+                expect="2 Export data to a Gaussian-type cube file",
+                max_wait=self._max_wait,
+            ),
             CommandStep("0", expect="0 Return to main menu"),
         ]
         result = self._run_commands(grid_commands, subdir=descriptor)
@@ -1210,6 +1160,398 @@ class Multiwfn:
             output_path.unlink()
             raise
         return output_path
+
+    def get_interaction(
+        self,
+        method: str,
+        output_dir: str | Path,
+        fragments: list[list[int]] | None = None,
+        mode: str = "inter",
+        contributions: tuple[str, ...] = (),
+        grid: str | dict[str, Any] = "medium",
+        density_cutoff: float | None = None,
+    ) -> dict[str, Any]:
+        """Export coupled NCI or IGMH fields to a new directory.
+
+        Args:
+            method: 'nci' for RDG or 'igmh' for Hirshfeld-based IGM.
+            output_dir: Explicit, unused destination; retained after close().
+            fragments: Disjoint, nonempty lists of 1-based atom indices for IGMH.
+                Atoms outside these fragments remain in the molecular density.
+            mode: IGMH fields to retain: 'inter', 'intra', or 'both' (also total).
+                Multiwfn computes all fields regardless of this selection.
+                NCI does not use this option; leave it at its default.
+            contributions: 'atom' and/or 'pair' delta-g indices for two fragments
+                in inter/both mode. Uses Multiwfn's high (40 radial, 170 angular)
+                atom-centered integration grid, independently of the cube grid.
+            grid: 'low', 'medium', 'high', or a dictionary with 'origin',
+                'spacing' (three components in Bohr), and 'shape' (grid points).
+            density_cutoff: NCI only: set RDG to 100 where rho >= this value
+                (electrons/Bohr^3). None disables density screening.
+
+        Returns:
+            Dictionary with method, fragments, grids (cube paths), metadata,
+            atomic_contributions and pair_contributions (None when not requested).
+            Contributions are delta-g indices in atomic units, using original
+            1-based atom numbers and fragment order for pair keys.
+            sign_lambda2_rho always uses the full molecular electron density.
+
+        Raises:
+            FileExistsError: If output_dir already exists.
+            RuntimeError: If outputs are incomplete or grids disagree.
+            BaseException: If export fails; the incomplete output is removed.
+
+        Notes:
+            These quantities are not interaction energies. Each export uses a
+            private process and settings, preserving any persistent session.
+            Existing destinations are refused; incomplete exports are removed.
+        """
+        method = self._normalize_option(method)
+        mode = self._normalize_option(mode)
+        contributions = tuple(sorted(set(contributions)))
+        density_cutoff = None if density_cutoff is None else float(density_cutoff)
+        fragments = self._validate_interaction(
+            method, fragments, mode, contributions, density_cutoff
+        )
+
+        output_dir = Path(output_dir).absolute()
+        if output_dir.exists() or output_dir.is_symlink():
+            raise FileExistsError(f"Output already exists: {output_dir}")
+
+        grid = self._validate_interaction_grid(grid)
+        commands = self._interaction_commands(method, fragments, contributions, grid)
+        run, version, settings_text = self._run_interaction(
+            commands, method, fragments, density_cutoff
+        )
+        filenames = {
+            "sign_lambda2_rho": "sl2r.cub" if method == "igmh" else "func1.cub"
+        }
+        if method == "nci":
+            filenames["rdg"] = "func2.cub"
+        else:
+            fields = {
+                "inter": ("inter",),
+                "intra": ("intra",),
+                "both": ("inter", "intra", "total"),
+            }[mode]
+            filenames.update(
+                {
+                    f"delta_g_{name}": "dg.cub" if name == "total" else f"dg_{name}.cub"
+                    for name in fields
+                }
+            )
+        geometries = [
+            self._read_interaction_grid(run.workdir / f) for f in filenames.values()
+        ]
+        if any(geometry != geometries[0] for geometry in geometries[1:]):
+            raise RuntimeError(
+                "Multiwfn produced interaction cubes with different grids."
+            )
+        atomic: dict[int, float] | None = None
+        pairs: dict[tuple[int, int], float] | None = None
+        if contributions and fragments is not None:
+            atomic, pairs = self._parse_interaction_contributions(
+                (run.workdir / "atmdg.txt").read_text(), fragments
+            )
+        metadata = {
+            "multiwfn_version": version,
+            "input_file": str(self._file_path),
+            "method": method,
+            "fragments": fragments,
+            "mode": mode if method == "igmh" else None,
+            "grid": geometries[0],
+            "requested_grid": grid,
+            "grid_units": "bohr",
+            "density_cutoff": density_cutoff,
+            "contributions": list(contributions),
+            "contribution_grid": (
+                {"radial": 40, "angular": 170} if contributions else None
+            ),
+            "settings": settings_text,
+        }
+        grids = {name: output_dir / f"{name}.cub" for name in filenames}
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir()
+        try:
+            for name, filename in filenames.items():
+                shutil.copyfile(run.workdir / filename, grids[name])
+            (output_dir / "metadata.json").write_text(
+                json.dumps(metadata, indent=2) + "\n"
+            )
+            if contributions:
+                shutil.copyfile(run.workdir / "atmdg.txt", output_dir / "atmdg.txt")
+        except BaseException:
+            shutil.rmtree(output_dir)
+            raise
+        self._results.citations.update(
+            (
+                "Tian Lu, Qinxue Chen, J. Comput. Chem., 43, 539 (2022) "
+                "DOI: 10.1002/jcc.26812",
+                "Tian Lu, Qinxue Chen, Erratum to IGMH, ChemRxiv (2022) "
+                "DOI: 10.26434/chemrxiv-2022-g1m34",
+            )
+            if method == "igmh"
+            else (
+                "Erin R. Johnson et al., J. Am. Chem. Soc., 132, 6498 (2010) "
+                "DOI: 10.1021/ja100936w",
+            )
+        )
+        return {
+            "method": method,
+            "fragments": fragments,
+            "grids": grids,
+            "metadata": metadata,
+            "atomic_contributions": atomic if "atom" in contributions else None,
+            "pair_contributions": pairs if "pair" in contributions else None,
+        }
+
+    def _interaction_commands(
+        self,
+        method: str,
+        fragments: list[list[int]] | None,
+        contributions: tuple[str, ...],
+        grid: str | dict[str, Any],
+    ) -> list[str | CommandStep]:
+        """Calculate coupled grids and optional atom-pair integrals."""
+        if isinstance(grid, str):
+            pattern = GRID_QUALITIES[grid]
+            grid_commands = [CommandStep(pattern.split()[0], expect=pattern)]
+        else:
+            grid_commands = [
+                CommandStep("5", expect="5 Input original point"),
+                CommandStep(
+                    ",".join(map(str, grid["origin"])),
+                    expect="coordinate of original point",
+                ),
+                CommandStep(
+                    ",".join(map(str, grid["spacing"])), expect="Input grid spacings"
+                ),
+                CommandStep(
+                    ",".join(map(str, grid["shape"])),
+                    expect="Input the number of points",
+                ),
+            ]
+        commands: list[str | CommandStep] = [
+            CommandStep("20", expect="20 Visual study of weak interaction"),
+            CommandStep(
+                "11" if method == "igmh" else "1",
+                expect="11 IGMH" if method == "igmh" else "1 NCI analysis",
+            ),
+        ]
+        if fragments is not None:
+            commands.append(
+                CommandStep(str(len(fragments)), expect="How many fragments")
+            )
+            commands.extend(
+                CommandStep(
+                    ",".join(map(str, fragment)),
+                    expect="Input atom indices for fragment",
+                )
+                for fragment in fragments
+            )
+        commands.extend(grid_commands)
+        commands.append(
+            CommandStep("3", expect="3 Output cube files", max_wait=self._max_wait)
+        )
+        if contributions:
+            commands.extend(
+                [
+                    CommandStep("6", expect="6 Evaluate contribution"),
+                    CommandStep("2", expect="2 High quality"),
+                    CommandStep(
+                        "n",
+                        expect="If outputting the two fragments as atmdg",
+                        max_wait=self._max_wait,
+                    ),
+                ]
+            )
+        commands.extend(
+            [CommandStep("0", expect="0 Exit"), CommandStep("0", expect="0 Return")]
+        )
+
+        return commands
+
+    def _run_interaction(
+        self,
+        commands: list[str | CommandStep],
+        method: str,
+        fragments: list[list[int]] | None,
+        density_cutoff: float | None,
+    ) -> tuple[MultiwfnRunResult, str, str]:
+        """Isolate settings and grid state from the parent's descriptor session."""
+        env = build_execution_env(env_variables=self._env_variables)
+        settings_source = self._settings_ini_path
+        if settings_source is None and "Multiwfnpath" in env:
+            candidate = Path(env["Multiwfnpath"]) / "settings.ini"
+            if candidate.is_file():
+                settings_source = candidate
+        settings_text = settings_source.read_text() if settings_source else ""
+        key, value = (
+            ("IGMvdwscl", 0)
+            if method == "igmh"
+            else ("RDG_maxrho", density_cutoff or 0)
+        )
+        settings_text = re.sub(rf"(?m)^[ \t]*{key}\s*=.*$", "", settings_text)
+        settings_text += f"\n {key}= {value}\n"
+
+        with Multiwfn(
+            self._file_path,
+            run_path=self._run_path / "interaction",
+            robust_mode=self._robust_mode,
+            debug=self._debug,
+            env_variables=env,
+            max_wait=self._max_wait,
+            has_spin=self._has_spin,
+            expect_timeout=self._expect_timeout,
+            persistent=True,
+        ) as worker:
+            settings_path = worker._run_path / "settings.ini"
+            settings_path.write_text(settings_text)
+            worker.load_settingini(settings_path)
+            loaded = worker._run_commands([])
+            if not re.search(r"GTFs:\s*[1-9]", loaded.stdout):
+                raise ValueError(
+                    "Interaction analysis requires a molecular wavefunction."
+                )
+            atoms = re.search(r"Atoms:\s*(\d+)", loaded.stdout)
+            version = re.search(r"Version[^\r\n]+", loaded.stdout)
+            if atoms is None or version is None:
+                raise RuntimeError("Could not read Multiwfn version and atom count.")
+            if fragments is not None and max(i for f in fragments for i in f) > int(
+                atoms[1]
+            ):
+                raise ValueError(f"Atom index exceeds the input's {atoms[1]} atoms.")
+            run = worker._run_commands(commands)
+
+        return run, version[0].strip(), settings_text
+
+    @staticmethod
+    def _validate_interaction(
+        method: str,
+        fragments: list[list[int]] | None,
+        mode: str,
+        contributions: tuple[str, ...],
+        density_cutoff: float | None,
+    ) -> list[list[int]] | None:
+        """Check chemical intent and normalize fragment indices."""
+        if method not in {"nci", "igmh"} or mode not in {"inter", "intra", "both"}:
+            raise ValueError("Use method nci/igmh and IGMH mode inter/intra/both.")
+        if not set(contributions) <= {"atom", "pair"}:
+            raise ValueError("Contributions must be 'atom' and/or 'pair'.")
+        if method == "nci" and (
+            fragments is not None or contributions or mode != "inter"
+        ):
+            raise ValueError("NCI does not support fragments, modes or contributions.")
+        if density_cutoff is not None and (
+            method != "nci" or not math.isfinite(density_cutoff) or density_cutoff <= 0
+        ):
+            raise ValueError("A density cutoff must be finite, positive and NCI-only.")
+        if method == "igmh":
+            if not fragments or any(not fragment for fragment in fragments):
+                raise ValueError("IGMH requires nonempty fragments.")
+            indices = [i for fragment in fragments for i in fragment]
+            if any(
+                not isinstance(i, (int, Integral)) or isinstance(i, bool) or i < 1
+                for i in indices
+            ) or len(set(indices)) != len(indices):
+                raise ValueError(
+                    "Fragments must contain distinct positive integer atom indices (1-based)."
+                )
+            fragments = [[int(i) for i in fragment] for fragment in fragments]
+            if mode != "intra" and len(fragments) < 2:
+                raise ValueError(
+                    "Interfragment analysis requires at least two fragments."
+                )
+            if contributions and (len(fragments) != 2 or mode == "intra"):
+                raise ValueError(
+                    "Contributions require two fragments and inter/both mode."
+                )
+
+        return fragments
+
+    @staticmethod
+    def _validate_interaction_grid(grid: str | dict[str, Any]) -> str | dict[str, Any]:
+        """Normalize a preset or explicit orthogonal grid without changing the input."""
+        if isinstance(grid, str):
+            grid = grid.strip().lower()
+            if grid not in GRID_QUALITIES:
+                raise ValueError("Grid must be low, medium, high or a grid dictionary.")
+            return grid
+        if not isinstance(grid, dict) or set(grid) != {"origin", "spacing", "shape"}:
+            raise ValueError("Grid dictionary must contain origin, spacing and shape.")
+        origin, spacing, shape = (grid[key] for key in ("origin", "spacing", "shape"))
+        if any(len(values) != 3 for values in (origin, spacing, shape)):
+            raise ValueError(
+                "Grid origin, spacing and shape must have three components."
+            )
+        if not all(math.isfinite(x) for x in origin):
+            raise ValueError("Grid origin must be finite.")
+        if not all(math.isfinite(x) and x > 0 for x in spacing):
+            raise ValueError("Grid spacing must be finite and positive.")
+        if not all(
+            isinstance(n, (int, Integral)) and not isinstance(n, bool) and int(n) >= 2
+            for n in shape
+        ):
+            raise ValueError("Grid shape must contain integers of at least two.")
+        return {
+            "origin": [float(x) for x in origin],
+            "spacing": [float(x) for x in spacing],
+            "shape": [int(n) for n in shape],
+        }
+
+    @staticmethod
+    def _read_interaction_grid(path: Path) -> dict[str, Any]:
+        """Read cube geometry without loading the scalar data into memory."""
+        with path.open() as source:
+            next(source)
+            next(source)
+            origin = [float(x) for x in next(source).split()[1:4]]
+            axes = [next(source).split() for _ in range(3)]
+        return {
+            "origin": origin,
+            "shape": [int(axis[0]) for axis in axes],
+            "spacing": [float(axis[i + 1]) for i, axis in enumerate(axes)],
+        }
+
+    @staticmethod
+    def _parse_interaction_contributions(
+        text: str, fragments: list[list[int]]
+    ) -> tuple[dict[int, float], dict[tuple[int, int], float]]:
+        """Read absolute delta-g indices, preserving original atom numbers."""
+        atomic = {
+            int(i): float(value)
+            for i, value in re.findall(rf"Atom\s+(\d+)\s*:\s*({NUMBER_PATTERN})", text)
+        }
+        pairs = {
+            (int(i), int(j)): float(value)
+            for i, j, value in re.findall(
+                rf"(?m)^\s*(\d+)\s+(\d+)\s*:\s*({NUMBER_PATTERN})", text
+            )
+        }
+        total = re.search(
+            rf"Sum of all atomic pair delta-g indices:\s*({NUMBER_PATTERN})", text
+        )
+        expected = {(i, j) for i in fragments[0] for j in fragments[1]}
+        if (
+            set(atomic) != {i for fragment in fragments for i in fragment}
+            or not set(pairs) <= expected
+            or "Atomic pair delta-g indices" not in text
+            or total is None
+        ):
+            raise RuntimeError("Incomplete or inconsistent IGMH contribution table.")
+        totals = [(float(total[1]), list(pairs.values()))]
+        for atom, value in atomic.items():
+            totals.append((value, [v for ij, v in pairs.items() if atom in ij]))
+        for value, terms in totals:
+            # Each printed term and its total may round by half of 1e-6.
+            if not math.isclose(
+                value,
+                math.fsum(terms),
+                rel_tol=0,
+                abs_tol=(len(terms) + 1) * 5e-7 + 1e-12,
+            ):
+                raise RuntimeError("Inconsistent IGMH contribution totals.")
+        return atomic, {pair: pairs.get(pair, 0.0) for pair in sorted(expected)}
 
     def get_fukui(self) -> dict[str, dict[int, float]]:
         """Calculate Fukui functions.
@@ -1234,7 +1576,10 @@ class Multiwfn:
         commands = [
             CommandStep("22", expect="22 Conceptual DFT"),
             CommandStep("6", expect="6 Calculate condensed OW Fukui"),
-            WaitProgress(self._max_wait),
+            CommandStep(
+                expect=rf"0 Return|(?i:{SINGLE_DETERMINANT_WFN_ERROR_PATTERN})",
+                max_wait=self._max_wait,
+            ),
             CommandStep(
                 "",
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
@@ -1280,15 +1625,16 @@ class Multiwfn:
         commands = [
             CommandStep("22", expect="22 Conceptual DFT"),
             CommandStep("8", expect="8 Calculate nucleophilic and electrophilic"),
-            WaitProgress(self._max_wait),
+            CommandStep(
+                expect=rf"0 Return|(?i:{SINGLE_DETERMINANT_WFN_ERROR_PATTERN})",
+                max_wait=self._max_wait,
+            ),
             CommandStep(
                 "",
                 expect=SINGLE_DETERMINANT_WFN_ERROR_PATTERN,
                 optional=True,
             ),
-            # Prompt text after option 8 varies across Multiwfn builds; send "0"
-            # unconditionally to return to the previous menu.
-            CommandStep("0"),
+            CommandStep("0", expect="0 Return"),
         ]
         result = self._run_commands(commands, subdir="superdeloc")
         self._raise_if_single_determinant_wavefunction_error(
@@ -1637,8 +1983,7 @@ class Multiwfn:
         commands = [
             *self._commands_fuzzy_partitioning(),
             CommandStep("4", expect="4 Calculate localization"),
-            WaitProgress(self._max_wait),
-            CommandStep("n", expect="y/n"),
+            CommandStep("n", expect="y/n", max_wait=self._max_wait),
             CommandStep("0", expect="0 Return"),
         ]
         result = self._run_commands(commands, subdir="localization")

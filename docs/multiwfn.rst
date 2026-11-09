@@ -17,7 +17,8 @@ For Multiwfn menu-level details, see the `Multiwfn manual`_.
 
 .. warning::
 
-    This module has only been tested with molden files derived from xTB, PySCF and ORCA.
+    Tests cover Molden files from xTB, PySCF and ORCA, with additional WFN and
+    WFX coverage.
     The `molden2aim`_ utility is recommended to standardize wavefunction files.
 
 ******
@@ -25,13 +26,12 @@ Module
 ******
 
 The :py:class:`Multiwfn <morfeus.multiwfn.Multiwfn>` class allows calculation
-of a variety of descriptors and properties from wavefunction (``.molden``/``.wfn``)
+of a variety of descriptors and properties from wavefunction (``.molden``/``.wfn``/``.wfx``)
 files.
 Additionally, grid files (``.cub`` or ``.grd``) can be generated or integrated.
 
 Several descriptors are spin-dependent and are handled by
 ``has_spin=<bool|None>``, inferred from the loaded wavefunction if not provided.
-All available options can be easily retrieved with the ``list_options()`` method.
 
 Citations used by the selected analyses can be collected directly:
 
@@ -43,14 +43,14 @@ Citations used by the selected analyses can be collected directly:
   >>> mwfn.get_charges("hirshfeld")
   >>> mwfn.get_citations()
 
-All available options can be accessesed with the ``list_options()`` method:
+All available options can be accessed with the ``list_options()`` method:
 
 .. code-block:: python
   :caption: Example
 
   >>> options = mwfn.list_options()
   >>> options.keys()
-  ['bond_order', 'charges', 'descriptors', 'descriptors_fast', 'grid_quality', 'surface']
+  ['bond_order', 'charges', 'descriptors', 'descriptors_fast', 'grid_quality', 'interaction', 'surface']
 
 
 #######################
@@ -151,47 +151,56 @@ Cube files can directly be integrated per atom with ``grid_to_descriptors()``.
   >>> cube_path.name
   'rho.cub'
 
-An explicit ``output_path`` is required. Exported files survive ``close()``;
-existing destinations are never overwritten. The former ``grid_file_name``
-argument is replaced by ``output_path``.
-
-Ordinary calculations use temporary scratch storage, removed when the context
-exits. To retain intermediate outputs, supply ``run_path``: each instance gets
-a unique subdirectory there, and each uncached analysis gets a fresh result
-directory. This prevents collisions between instances and repeated calculations.
-Settings are copied only into the process working directory.
+Exported cube files are retained at the requested destination. Intermediate
+calculation files are temporary by default.
 
 For quantitative total-density analysis from xTB, prefer the Molden wavefunction
-and ``Multiwfn.get_descriptor("rho")`` or ``get_grid("rho", ...)``. The xTB 6.7.1
-cube exporter can produce an incorrectly normalized density, also noted in the
-`critic2 documentation <https://aoterodelaroza.github.io/critic2/manual/fields/#molecular-molden-style-files-molden-and-moldeninput>`_.
+and ``Multiwfn.get_descriptor("rho")`` or ``get_grid("rho", ...)``. 
 Check electron and spin integrals before using exported cubes quantitatively.
+
+
+#########################
+NCI and IGMH interactions
+#########################
+
+Noncovalent interaction (NCI) analysis :footcite:`johnson_revealing_2010` and the
+independent gradient model based on Hirshfeld partition (IGMH)
+:footcite:`lu_chen_igmh_2022` characterize interactions from the electron density.
+``get_interaction()`` exports these fields as cube files. IGMH also supports
+fragment analysis and atomic or atom-pair contributions.
+
+.. code-block:: python
+  :caption: Example
+
+  >>> with Multiwfn("complex.wfx") as mwfn:
+  ...     nci = mwfn.get_interaction("nci", output_dir="results/nci")
+  ...     igmh = mwfn.get_interaction(
+  ...         "igmh", output_dir="results/igmh", fragments=[[1, 2, 3], [4, 5, 6]],
+  ...     )
+  >>> inter_cube = igmh["grids"]["delta_g_inter"]
+
+These descriptors describe interaction patterns, not interaction energies.
+For details, see :py:meth:`get_interaction <morfeus.multiwfn.Multiwfn.get_interaction>`.
 
 
 #################################
 Orbital records and frontier gaps
 #################################
 
-``get_orbitals()`` returns a list of dictionaries with ``index``, ``spin``,
-``occupation``, and ``energy_ev`` keys. Indices and
-ordering are preserved from Multiwfn. Energies are read directly from its eV
-column. Spin labels are ``restricted`` (A+B), ``alpha`` (A) and ``beta`` (B).
-
-``get_frontier_gaps()`` reports one ``restricted`` result for occupations near
-0/2, or independent ``alpha`` and ``beta`` results for occupations near 0/1.
+Orbital records and HOMO–LUMO gaps are available in eV. Gaps are calculated
+within each spin channel:
 
 .. code-block:: python
+  :caption: Example
 
-   orbitals = mwfn.get_orbitals()
-   frontiers = mwfn.get_frontier_gaps()
-   gap = frontiers["restricted"]["gap_ev"]
+  >>> with Multiwfn("molden.input") as mwfn:
+  ...     orbitals = mwfn.get_orbitals()
+  ...     frontiers = mwfn.get_frontier_gaps()
+  >>> gap = frontiers["restricted"]["gap_ev"]
 
-Each result contains ``homo_energy_ev``, ``lumo_energy_ev``, ``gap_ev``,
-``homo_indices`` and ``lumo_indices``. Frontier energies are the maximum occupied
-and minimum unoccupied energies within the same channel.
-The reported gap is the signed difference :math:`\varepsilon_\mathrm{LUMO} -
-\varepsilon_\mathrm{HOMO}` and can be negative for non-Aufbau occupations.
-These orbital-energy differences are not excitation energies.
+The signed gap, :math:`\varepsilon_\mathrm{LUMO} - \varepsilon_\mathrm{HOMO}`,
+can be negative for non-Aufbau occupations. These are orbital-energy differences,
+not excitation energies.
 
 
 ####################
@@ -201,16 +210,13 @@ Persistent execution
 By default, each calculation starts a fresh process. To opt into process reuse:
 
 .. code-block:: python
+  :caption: Example
 
-   with Multiwfn("molden.input", persistent=True) as mwfn:
-       charges = mwfn.get_charges("hirshfeld")
-       moments = mwfn.get_electric_moments()
+  >>> with Multiwfn("molden.input", persistent=True) as mwfn:
+  ...     charges = mwfn.get_charges("hirshfeld")
+  ...     moments = mwfn.get_electric_moments()
 
-The wavefunction is loaded once and reused across descriptor calls.
-Input and settings files should remain unchanged. Each analysis has a separate 
-transcript and output directory. Custom ``run_commands()`` sequences must return 
-to the main menu, without quitting. Use a context manager or call ``close()`` 
-to release the process.
+The loaded wavefunction is reused until the context exits or ``close()`` is called.
 
 
 **********

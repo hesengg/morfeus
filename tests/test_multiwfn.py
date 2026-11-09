@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from types import SimpleNamespace
+import shutil
 from unittest.mock import Mock
 
 import numpy as np
 from numpy.testing import assert_array_almost_equal
 import pytest
 
+from morfeus.io import CubeParser
 import morfeus.multiwfn as multiwfn
 from morfeus.multiwfn import CommandStep, Multiwfn, MultiwfnRunResult
 
@@ -39,6 +41,306 @@ SINGLET_TRIPLET_EQUIVALENT_FILES = (
     ),
 )
 MULTIPOLE_KEYS = ("quadrupole_spherical_magnitude", "quadrupole_traceless_magnitude")
+
+
+@pytest.mark.multiwfn
+@pytest.mark.parametrize("persistent", [False, True])
+def test_interaction_workflow(tmp_path, persistent):
+    """Coupled fields, contributions and cutoff changes preserve descriptor state."""
+    box = {"origin": (-4, -4, -4), "spacing": (1, 1, 1), "shape": (9, 9, 9)}
+    fragments = [[7, 8, 9], [4, 12, 13]]
+    settings = tmp_path / "settings.ini"
+    settings.write_text(" nthreads=1\n RDG_maxrho=0.005\n IGMvdwscl=2\n")
+    with Multiwfn(
+        EXAMPLE_MOLDEN_DIR / "pyscf_dft_singlet_rks.molden", persistent=persistent
+    ) as m:
+        m.load_settingini(settings)
+        charges = m.get_charges("hirshfeld")
+        pid = m._session._child.pid if m._session else None
+        fields = {}
+        for mode in ("inter", "intra", "both"):
+            result = m.get_interaction(
+                "igmh",
+                tmp_path / mode,
+                fragments=fragments,
+                mode=mode,
+                grid=box,
+                contributions=("atom", "pair") if mode == "both" else (),
+            )
+            fields[mode] = {
+                key: CubeParser(path).S for key, path in result["grids"].items()
+            }
+            assert (
+                json.loads((tmp_path / mode / "metadata.json").read_text())
+                == result["metadata"]
+            )
+            assert result["metadata"]["multiwfn_version"].startswith("Version ")
+            assert result["metadata"]["grid"] == {
+                "origin": [-4, -4, -4],
+                "spacing": [1, 1, 1],
+                "shape": [9, 9, 9],
+            }
+            assert all(np.isfinite(values).all() for values in fields[mode].values())
+        assert box == {"origin": (-4, -4, -4), "spacing": (1, 1, 1), "shape": (9, 9, 9)}
+        both = fields["both"]
+        assert set(both) == {
+            "sign_lambda2_rho",
+            "delta_g_inter",
+            "delta_g_intra",
+            "delta_g_total",
+        }
+        for mode in ("inter", "intra"):
+            assert set(fields[mode]) == {"sign_lambda2_rho", f"delta_g_{mode}"}
+            np.testing.assert_allclose(
+                fields[mode][f"delta_g_{mode}"], both[f"delta_g_{mode}"]
+            )
+        np.testing.assert_allclose(
+            both["delta_g_total"],
+            both["delta_g_inter"] + both["delta_g_intra"],
+            atol=2e-7,
+        )
+        assert both["delta_g_inter"].max() > 0
+        atomic, pairs = result["atomic_contributions"], result["pair_contributions"]
+        assert atomic is not None and pairs is not None
+        assert set(atomic) == {i for fragment in fragments for i in fragment}
+        assert set(pairs) == {(i, j) for i in fragments[0] for j in fragments[1]}
+        assert pairs[8, 4] == pytest.approx(0.016178, abs=2e-6)
+        assert atomic[4] == pytest.approx(0.035466, abs=2e-6)
+        for atom, value in atomic.items():
+            assert value == pytest.approx(
+                sum(v for ij, v in pairs.items() if atom in ij), abs=3e-6
+            )
+        for cutoff in (None, 0.02, 0.1):
+            nci = m.get_interaction(
+                "nci", tmp_path / f"nci-{cutoff}", grid=box, density_cutoff=cutoff
+            )
+            rdg = CubeParser(nci["grids"]["rdg"]).S
+            sl2r = CubeParser(nci["grids"]["sign_lambda2_rho"]).S
+            np.testing.assert_allclose(sl2r, both["sign_lambda2_rho"])
+            assert nci["metadata"]["density_cutoff"] == cutoff
+            if cutoff is None:
+                raw = rdg
+                assert np.any((abs(sl2r) > 0.1) & (raw < 100))
+            else:
+                np.testing.assert_allclose(rdg, np.where(abs(sl2r) >= cutoff, 100, raw))
+        with (
+            Multiwfn(nci["grids"]["rdg"]) as cube,
+            pytest.raises(ValueError, match="wavefunction"),
+        ):
+            cube.get_interaction("nci", tmp_path / "unsupported", grid=box)
+        repeat = m.get_interaction(
+            "igmh", tmp_path / "repeat", fragments=fragments, grid=box
+        )
+        np.testing.assert_array_equal(
+            CubeParser(repeat["grids"]["delta_g_inter"]).S, both["delta_g_inter"]
+        )
+        assert repeat["metadata"] == json.loads(
+            (tmp_path / "inter/metadata.json").read_text()
+        )
+        with pytest.raises(FileExistsError):
+            m.get_interaction("nci", tmp_path / "repeat", grid=box)
+        with pytest.raises(ValueError, match="exceeds"):
+            m.get_interaction(
+                "igmh", tmp_path / "invalid", fragments=[[1], [15]], grid=box
+            )
+        assert m.get_charges("hirshfeld") == charges
+        parent_grid = m.get_grid(
+            "rdg", ["5", "-4,-4,-4", "1,1,1", "9,9,9"], tmp_path / "parent.cub"
+        )
+        np.testing.assert_allclose(
+            CubeParser(parent_grid).S, np.where(abs(sl2r) >= 0.005, 100, raw)
+        )
+        if persistent:
+            assert m._session is not None
+            assert m._session._child.pid == pid
+    assert all(path.is_file() for path in result["grids"].values())
+    assert settings.read_text() == " nthreads=1\n RDG_maxrho=0.005\n IGMvdwscl=2\n"
+
+
+@pytest.mark.multiwfn
+def test_interaction_fragment_modes(tmp_path):
+    """One fragment has no interfragment field; multiple fragments decompose total."""
+    with Multiwfn(EXAMPLE_MOLDEN_DIR / "pyscf_dft_triplet_uks.molden") as m:
+        one = m.get_interaction(
+            "igmh", tmp_path / "one", fragments=[[1, 2, 7]], mode="intra", grid="low"
+        )
+        assert CubeParser(one["grids"]["delta_g_intra"]).S.max() > 0
+        three = m.get_interaction(
+            "igmh",
+            tmp_path / "three",
+            fragments=[[7], [4], [12]],
+            mode="both",
+            grid={"origin": (-4, -4, -4), "spacing": (1, 1, 1), "shape": (9, 9, 9)},
+        )
+        assert np.allclose(CubeParser(three["grids"]["delta_g_intra"]).S, 0, atol=1e-12)
+        np.testing.assert_allclose(
+            CubeParser(three["grids"]["delta_g_total"]).S,
+            CubeParser(three["grids"]["delta_g_inter"]).S,
+        )
+        exported = m.run_commands(["100", "2", "4", "wavefunction.wfx", "0"])
+        with Multiwfn(exported.workdir / "wavefunction.wfx") as wfx:
+            assert wfx._has_spin
+            result = wfx.get_interaction(
+                "igmh",
+                tmp_path / "wfx",
+                fragments=three["fragments"],
+                mode="both",
+                grid=three["metadata"]["grid"],
+            )
+            for name in three["grids"]:
+                np.testing.assert_allclose(
+                    CubeParser(result["grids"][name]).S,
+                    CubeParser(three["grids"][name]).S,
+                    atol=2e-7,
+                )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"method": "igm"},
+        {"fragments": None},
+        {"fragments": []},
+        {"fragments": [[1], []]},
+        {"fragments": [[1, 1], [2]]},
+        {"fragments": [[1], [1, 2]]},
+        {"fragments": [[0], [2]]},
+        {"fragments": [[1.5], [2]]},
+        {"fragments": [[True], [2]]},
+        {"fragments": [[1]], "mode": "inter"},
+        {"mode": "invalid"},
+        {"grid": "invalid"},
+        {"grid": {"origin": (0, 0, 0)}},
+        {
+            "grid": {
+                "origin": (0, 0, 0),
+                "spacing": (1, 1, 1),
+                "shape": (2, 2, 2),
+                "units": "bohr",
+            }
+        },
+        {"contributions": ("energy",)},
+        {"mode": "intra", "contributions": ("atom",)},
+        {"fragments": [[1], [2], [3]], "contributions": ("pair",)},
+        {"density_cutoff": 0.05},
+        {"method": "nci", "fragments": []},
+        {"method": "nci", "fragments": None, "mode": "both"},
+        {"method": "nci", "fragments": None, "contributions": ("atom",)},
+        *(
+            {"method": "nci", "fragments": None, "density_cutoff": x}
+            for x in (0, -1, float("nan"), float("inf"))
+        ),
+    ],
+)
+def test_interaction_validation(tmp_path, monkeypatch, options):
+    """Reject incompatible chemical intent before starting a calculation."""
+    path = tmp_path / "input.molden"
+    path.touch()
+    monkeypatch.setattr(
+        Multiwfn, "_run_commands", Mock(side_effect=AssertionError("Must not run"))
+    )
+    args = {"method": "igmh", "fragments": [[1], [2]], **options}
+    with Multiwfn(path, has_spin=False) as m, pytest.raises(ValueError):
+        m.get_interaction(output_dir=tmp_path / "out", **args)
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("origin", (0, 0)),
+        ("origin", (0, 0, float("nan"))),
+        ("spacing", (1, 0, 1)),
+        ("spacing", (1, 1, float("inf"))),
+        ("shape", (2, 1, 2)),
+        ("shape", (2, 2, 2.5)),
+        ("shape", (True, 2, 2)),
+    ],
+)
+def test_interaction_grid_validation(field, value):
+    """Reject grids that cannot represent a finite three-dimensional volume."""
+    with pytest.raises(ValueError):
+        Multiwfn._validate_interaction_grid(
+            {
+                "origin": (0, 0, 0),
+                "spacing": (1, 1, 1),
+                "shape": (2, 2, 2),
+                field: value,
+            }
+        )
+
+
+@pytest.mark.parametrize("failure", ["missing", "geometry", "copy", "collision"])
+def test_interaction_export_failures(tmp_path, monkeypatch, failure):
+    """Fail on incomplete cubes and preserve existing destinations during export."""
+    source = tmp_path / "generated"
+    source.mkdir()
+    header = "cube\ncomment\n1 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n"
+    (source / "func1.cub").write_text(header)
+    if failure != "missing":
+        (source / "func2.cub").write_text(
+            header.replace("2 1 0 0", "3 1 0 0") if failure == "geometry" else header
+        )
+    path = tmp_path / "input.molden"
+    path.touch()
+    destination = tmp_path / "out"
+
+    def run(self, commands, subdir=None):
+        if commands and failure == "collision":
+            destination.mkdir()
+            (destination / "keep").write_text("original")
+        return MultiwfnRunResult(
+            "Version 3.8, update date: 2026-Jan-7\nAtoms: 14, GTFs: 114", source
+        )
+
+    def copy(source, target):
+        target.write_text("partial")
+        raise OSError("Export failed")
+
+    monkeypatch.setattr(Multiwfn, "_run_commands", run)
+    if failure == "copy":
+        monkeypatch.setattr(shutil, "copyfile", copy)
+    error = {
+        "missing": FileNotFoundError,
+        "geometry": RuntimeError,
+        "copy": OSError,
+        "collision": FileExistsError,
+    }[failure]
+    with Multiwfn(path, has_spin=False) as m, pytest.raises(error):
+        m.get_interaction("nci", destination)
+    if failure == "collision":
+        assert (destination / "keep").read_text() == "original"
+    else:
+        assert not destination.exists()
+
+
+def test_interaction_contribution_totals():
+    """Allow rounding and omitted zeros, but reject missing or inconsistent data."""
+    table = (
+        "Atom 7 : 0.100001\nAtom 2 : 0.000000\n"
+        "Atom 8 : 0.050001\nAtom 3 : 0.050001\n"
+        "Atomic pair delta-g indices\n"
+        "7 8 : 0.050001\n7 3 : 0.050001\n"
+        "Sum of all atomic pair delta-g indices: 0.100001\n"
+    )
+    fragments = [[7, 2], [8, 3]]
+    parse = Multiwfn._parse_interaction_contributions
+    atomic, pairs = parse(table, fragments)
+    assert atomic[7] == 0.100001
+    assert pairs == {(7, 8): 0.050001, (7, 3): 0.050001, (2, 8): 0, (2, 3): 0}
+    for damaged in (
+        table.replace("7 8 :", "7,8 :").replace("7 3 :", "7,3 :"),
+        table.replace("7 8 : 0.050001\n", ""),
+        table.replace("Atom 7 : 0.100001", "Atom 7 : 0.200001"),
+        table.replace("indices: 0.100001", "indices: 0.200001"),
+        table.split("Sum of all")[0],
+    ):
+        with pytest.raises(RuntimeError, match="IGMH contribution"):
+            parse(damaged, fragments)
+    zero = table.replace("7 8 : 0.050001\n7 3 : 0.050001\n", "")
+    zero = zero.replace("0.100001", "0.000000").replace("0.050001", "0.000000")
+    atomic, pairs = parse(zero, fragments)
+    assert set(atomic.values()) == set(pairs.values()) == {0}
 
 
 def test_parse_custom_commands_accepts_supported_step_forms() -> None:
@@ -369,44 +671,35 @@ def test_persistent_custom_commands_and_failure(tmp_path):
 
 
 @pytest.mark.multiwfn
-@pytest.mark.parametrize(
-    "events,expected",
-    [
-        (
-            [(0, "Progress: [#-] 50 %"), (1, "Progress: [##] 100 %")],
-            "Progress: [#-] 50 %Progress: [##] 100 %",
-        ),
-        ([(0, "Progress: [#-] 50 %"), (1, "0 Return")], "Progress: [#-] 50 %0 Return"),
-        ([(2, "TIMEOUT")], ""),
-        (
-            [(0, "Progress: [#-] 50 %"), (1, "TIMEOUT"), (31, "TIMEOUT")],
-            "Progress: [#-] 50 %",
-        ),
-        ([(0, "EOF")], ""),
-    ],
-)
-def test_progress_wait_stops_and_preserves_output(monkeypatch, events, expected):
-    """Keep menu output and distinguish initial wait, idle timeout and completion."""
+@pytest.mark.parametrize("ending", ["ready", "timeout", "exit"])
+def test_calculation_wait_requires_completion(ending):
+    """Send only after the final prompt; a stalled or dead process cannot continue."""
     pexpect = pytest.importorskip("pexpect")
-    clock = [0.0]
-    pending = iter(events)
-
-    def read(**kwargs):
-        clock[0], value = next(pending)
-        if value == "TIMEOUT":
-            raise pexpect.TIMEOUT("idle")
-        if value == "EOF":
-            raise pexpect.EOF("exited")
-        return value
-
-    monkeypatch.setattr(multiwfn, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    session = object.__new__(multiwfn._PexpectSession)
-    session._child = Mock(read_nonblocking=Mock(side_effect=read))
-    session._debug = False
-    session._transcript = []
-    session.wait_for_progress(max_wait=30)
-    assert session.stdout == expected
-    assert session._child.read_nonblocking.call_count == len(events)
+    for robust in (False, True):
+        session = object.__new__(multiwfn._PexpectSession)
+        session._transcript, session._last_command_pos, session._debug = [], 0, False
+        session._expect_timeout = 0.1
+        session._child = Mock()
+        session._child.read_nonblocking.side_effect = [
+            "Progress: [####] 100%\nCalculating next stage...",
+            "Progress: [####] 100%\n",
+            "3 Output cube",
+            {
+                "ready": " files\n",
+                "timeout": pexpect.TIMEOUT("idle"),
+                "exit": pexpect.EOF("exit"),
+            }[ending],
+            pexpect.TIMEOUT("idle"),
+        ]
+        step = CommandStep("3", expect="3 Output cube files", max_wait=1)
+        if ending == "ready":
+            session._process_command(step, robust)
+            session._child.sendline.assert_called_once_with("3")
+            assert session.stdout.endswith("3 Output cube files\n")
+        else:
+            with pytest.raises(RuntimeError, match="Expected pattern"):
+                session._process_command(step, robust)
+            session._child.sendline.assert_not_called()
 
 
 @pytest.mark.multiwfn
